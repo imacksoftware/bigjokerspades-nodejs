@@ -9,9 +9,11 @@ const {
   deckSummary
 } = require("./functions/deck");
 
+const { dealHands } = require("./functions/deal");
+
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: lobby-v4-m2-deck");
+console.log("SERVER VERSION: lobby-v5-m3-deal");
 
 const rooms = new Map();
 
@@ -23,7 +25,8 @@ function makeEmptyRoom(roomId) {
     phase: "lobby", // lobby | playing | complete (later)
     clients: new Set(),
     config: defaultConfig(),
-    deck: null, // milestone 2: shuffled deck stored here at game start
+    deck: null,
+    hands: null, // milestone 3: {1:[],2:[],3:[],4:[]}
     seats: [
       { seat: 1, clientId: null, isBot: false, ready: false },
       { seat: 2, clientId: null, isBot: false, ready: false },
@@ -119,7 +122,8 @@ function abortToLobby(room, reason) {
 
   room.phase = "lobby";
   room.startedAt = null;
-  room.deck = null; // clear deck on abort
+  room.deck = null;
+  room.hands = null;
   resetAllReady(room);
 
   broadcast(room, {
@@ -132,6 +136,28 @@ function abortToLobby(room, reason) {
   sendState(room);
 }
 
+/**
+ * Send the correct private hand to a client (if seated + hands exist).
+ */
+function sendPrivateHandIfAvailable(room, ws) {
+  if (room.phase !== "playing") return;
+  if (!room.hands) return;
+
+  const seatObj = findSeatForClient(room, ws._clientId);
+  if (!seatObj) return;
+
+  const seatNum = seatObj.seat;
+  const hand = room.hands[seatNum];
+  if (!hand) return;
+
+  safeSend(ws, {
+    type: "hand_dealt",
+    room_id: room.roomId,
+    seat: seatNum,
+    hand, // full card objects (your choice B)
+  });
+}
+
 function startGame(room) {
   room.phase = "playing";
   room.startedAt = Date.now();
@@ -139,20 +165,35 @@ function startGame(room) {
   // reset lobby readiness per your requirement
   resetAllReady(room);
 
-  // ===== milestone 2: build + shuffle deck, store it =====
+  // ===== milestone 2: build + shuffle deck =====
   const built = buildDeck(room.config);
   room.deck = shuffleDeck(built);
 
   const summary = deckSummary(room.deck, 8);
   console.log(`[${room.roomId}] deck built`, summary);
 
-  // optional: send summary to clients for verification (no full deck)
   broadcast(room, {
     type: "deck_built",
     room_id: room.roomId,
     summary,
   });
-  // ================================================
+  // ============================================
+
+  // ===== milestone 3: deal hands (private) =====
+  room.hands = dealHands(room.deck);
+
+  // public: everyone learns that hands exist (no contents)
+  broadcast(room, {
+    type: "hands_dealt",
+    room_id: room.roomId,
+    counts: { 1: 13, 2: 13, 3: 13, 4: 13 },
+  });
+
+  // private: only send each client their own seat hand
+  for (const clientWs of room.clients) {
+    sendPrivateHandIfAvailable(room, clientWs);
+  }
+  // ============================================
 
   broadcast(room, {
     type: "game_started",
@@ -205,6 +246,9 @@ wss.on("connection", (ws, req) => {
   // initial sync
   sendState(room);
   sendYouAre(ws, room);
+
+  // if someone joins late during playing, and they have a seat, send their hand
+  sendPrivateHandIfAvailable(room, ws);
 
   ws.on("message", (raw) => {
     let msg;
