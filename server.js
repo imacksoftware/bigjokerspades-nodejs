@@ -16,7 +16,7 @@ const {
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: milestone-6A strict legality (renege OFF) + play_audit");
+console.log("SERVER VERSION: milestone-6A (renege OFF) + legality + spades_broken");
 
 const rooms = new Map();
 
@@ -38,8 +38,7 @@ function makeEmptyRoom(roomId) {
     config: {
       big_joker: "color", // "color" | "bw"
       big_deuce: "D2", // "D2" | "S2"
-      // milestone-6A assumption: renege OFF (strict legality)
-      renege_enabled: false,
+      renege_enabled: false, // milestone 6A = OFF
     },
 
     dealer_seat: null,
@@ -47,22 +46,17 @@ function makeEmptyRoom(roomId) {
     trick_index: 0, // 1..13
     books: { A: 0, B: 0 },
 
-    // spades restriction tracker (ignored when renege ON later)
-    spadesBroken: false,
+    spades_broken: false,
 
     hands: { 1: [], 2: [], 3: [], 4: [] },
 
     current_trick: {
       leaderSeat: null,
-      leadSuit: null,
+      leadSuit: null, // effective suit (S/H/D/C)
       plays: [], // { seat, card }
     },
 
-    trickHistory: [],
-
-    // full audit per play (for future renege accusations + replay/debug)
-    // entry: { t, trick_index, seat, card_id, lead_suit, hand_before:[card], hand_after:[card] }
-    playAudit: [],
+    trickHistory: [], // [{ trick_index, lead_suit, plays:[{seat,card_id}], winner_seat, winner_team }]
   };
 }
 
@@ -100,8 +94,7 @@ function roomPublicState(room) {
     trick_index: room.trick_index,
     books: room.books,
 
-    // expose for debugging now; can hide later
-    spades_broken: room.spadesBroken,
+    spades_broken: room.spades_broken,
 
     current_trick: {
       leaderSeat: room.current_trick.leaderSeat,
@@ -112,7 +105,6 @@ function roomPublicState(room) {
       })),
     },
 
-    // last 20 tricks for UI history
     trick_history: room.trickHistory.slice(-20),
   };
 }
@@ -192,8 +184,7 @@ function abortToLobby(room, reason) {
   room.hands = { 1: [], 2: [], 3: [], 4: [] };
   room.current_trick = { leaderSeat: null, leadSuit: null, plays: [] };
   room.trickHistory = [];
-  room.playAudit = [];
-  room.spadesBroken = false;
+  room.spades_broken = false;
 
   resetAllReady(room);
 
@@ -202,12 +193,10 @@ function abortToLobby(room, reason) {
 }
 
 function startGame(room) {
-  // probe for first diamond deals
   const probeDeck = shuffleDeck(buildDeck(room.config));
   const probe = determineFirstDealerSeat(probeDeck);
   room.dealer_seat = probe.dealer_seat;
 
-  // reshuffle and deal
   const liveDeck = shuffleDeck(buildDeck(room.config));
   room.hands = dealHands(liveDeck);
 
@@ -215,8 +204,7 @@ function startGame(room) {
   room.trick_index = 1;
   room.books = { A: 0, B: 0 };
   room.trickHistory = [];
-  room.playAudit = [];
-  room.spadesBroken = false;
+  room.spades_broken = false;
 
   const firstLeader = leftOfDealer(room.dealer_seat);
 
@@ -260,57 +248,41 @@ function requirePlaying(room, ws) {
 }
 
 /**
- * milestone 6A legality (renege OFF):
- * - must follow suit if possible
- * - spades/jokers/deuces (effectiveSuit=S) cannot be led until broken,
- *   unless the leader has ONLY spades/trump left
- * - if you cannot follow suit, you may play any card (including spade),
- *   and that breaks spades if effectiveSuit(card)==S
+ * milestone 6A legality (renege OFF)
+ * - must follow suit (using effectiveSuit)
+ * - cannot lead spade/trump until broken, unless leader has ONLY spades/trump
+ * - if you cannot follow suit, you may play anything (including spades even if not broken)
  */
-function isLegalPlay(room, seatNum, card) {
-  // if later we enable renege, legality gate becomes permissive
+function checkLegality(room, hand, card, isLeaderPlay) {
+  // renege ON (future): allow everything, no spade restriction
   if (room.config && room.config.renege_enabled) {
     return { ok: true };
   }
 
-  const hand = room.hands?.[seatNum] || [];
-  const trick = room.current_trick;
-  const isLeaderPlay = !trick || !Array.isArray(trick.plays) || trick.plays.length === 0;
+  const cardSuitEff = effectiveSuit(card);
 
-  const cardSuit = effectiveSuit(card); // "S" is trump in this game
-
-  // leading a trick
+  // leader play = first play of trick
   if (isLeaderPlay) {
-    if (cardSuit === "S" && room.spadesBroken === false) {
-      // allowed only if the player has ONLY spades/trump left
+    if (cardSuitEff === "S" && !room.spades_broken) {
       const hasNonTrump = hand.some((c) => effectiveSuit(c) !== "S");
       if (hasNonTrump) {
-        return { ok: false, error: "illegal_lead_spade" };
+        return { ok: false, error: "illegal_lead_spade_unbroken" };
       }
     }
     return { ok: true };
   }
 
-  // following in a trick
-  const leadSuit = trick.leadSuit; // effective suit of first card played
-  if (!leadSuit) {
-    // should never happen, but be permissive
-    return { ok: true };
-  }
+  // follower play
+  const leadSuit = room.current_trick.leadSuit; // already effective suit
+  if (!leadSuit) return { ok: true }; // safety
 
   const hasLeadSuit = hand.some((c) => effectiveSuit(c) === leadSuit);
 
-  if (hasLeadSuit) {
-    // must follow suit
-    if (cardSuit !== leadSuit) {
-      return { ok: false, error: "must_follow_suit" };
-    }
-
-    // if leadSuit isn't spade, and they are following suit properly, ok
-    return { ok: true };
+  if (hasLeadSuit && cardSuitEff !== leadSuit) {
+    return { ok: false, error: "illegal_must_follow_suit" };
   }
 
-  // cannot follow suit => any card allowed (including spade)
+  // if you don't have the suit led, you can play anything (including spades even if unbroken)
   return { ok: true };
 }
 
@@ -335,61 +307,33 @@ function handlePlayCard(room, ws, cardIdRaw) {
   const idx = hand.findIndex((c) => c.id === cardId);
   if (idx === -1) return safeSend(ws, { type: "error", error: "card_not_in_hand" });
 
-  // we need the card object for legality check BEFORE removing
   const card = hand[idx];
 
-  // legality gate (renege OFF)
-  const legality = isLegalPlay(room, seatNum, card);
+  // legality BEFORE removing the card
+  const isLeaderPlay = room.current_trick.plays.length === 0;
+  const legality = checkLegality(room, hand, card, isLeaderPlay);
   if (!legality.ok) {
-    return safeSend(ws, { type: "error", error: legality.error });
+    safeSend(ws, { type: "error", error: legality.error });
+    return;
   }
 
-  // ===== play audit snapshots (option B: full card objects) =====
-  const handBefore = hand.map((c) => ({ ...c }));
-
-  // remove card (use idx we already found)
+  // remove card from hand after legality passes
   hand.splice(idx, 1);
 
-  const handAfter = hand.map((c) => ({ ...c }));
-
-  const leadSuitForAudit =
-    room.current_trick && Array.isArray(room.current_trick.plays) && room.current_trick.plays.length > 0
-      ? room.current_trick.leadSuit
-      : effectiveSuit(card);
-
-  room.playAudit.push({
-    t: Date.now(),
-    trick_index: room.trick_index,
-    seat: seatNum,
-    card_id: card.id,
-    lead_suit: leadSuitForAudit,
-    hand_before: handBefore,
-    hand_after: handAfter,
-  });
-
-  if (room.playAudit.length > 500) room.playAudit = room.playAudit.slice(-500);
-  // ============================================================
-
-  // initialize trick if needed
+  // init trick if needed
   if (!room.current_trick) {
     room.current_trick = { leaderSeat: seatNum, leadSuit: null, plays: [] };
   }
 
-  // set lead suit if first play of trick
+  // set lead suit if first play (effective suit!)
   if (room.current_trick.plays.length === 0) {
     room.current_trick.leaderSeat = seatNum;
     room.current_trick.leadSuit = effectiveSuit(card);
   }
 
-  // spades broken logic (ONLY when strict legality mode is on)
-  // - if any spade/trump is legally played into a non-spade lead (or led when only-spades-left),
-  //   spades become broken.
-  if (!room.config.renege_enabled && room.spadesBroken === false) {
-    if (effectiveSuit(card) === "S") {
-      // if it's the first play and allowed only-spades-left, it breaks spades.
-      // if it's a follow play because they couldn't follow suit, it breaks spades.
-      room.spadesBroken = true;
-    }
+  // if any trump/spade is ever played, spades are broken
+  if (!room.spades_broken && effectiveSuit(card) === "S") {
+    room.spades_broken = true;
   }
 
   room.current_trick.plays.push({ seat: seatNum, card });
@@ -405,7 +349,7 @@ function handlePlayCard(room, ws, cardIdRaw) {
       room.current_trick.plays.length >= 4 ? null : nextSeatClockwise(room.turn_seat),
   });
 
-  // if trick complete
+  // trick complete
   if (room.current_trick.plays.length >= 4) {
     const winnerSeat = determineTrickWinner(room.current_trick);
     const winnerTeam = teamForSeat(winnerSeat);
@@ -429,7 +373,6 @@ function handlePlayCard(room, ws, cardIdRaw) {
       books: room.books,
     });
 
-    // 13 tricks -> end hand (dev loop)
     if (room.trick_index >= 13) {
       broadcast(room, {
         type: "hand_complete",
@@ -441,7 +384,6 @@ function handlePlayCard(room, ws, cardIdRaw) {
       return;
     }
 
-    // next trick
     room.trick_index += 1;
     room.current_trick = { leaderSeat: winnerSeat, leadSuit: null, plays: [] };
     room.turn_seat = winnerSeat;
@@ -453,10 +395,10 @@ function handlePlayCard(room, ws, cardIdRaw) {
   // advance turn
   room.turn_seat = nextSeatClockwise(room.turn_seat);
 
-  // private update to the player who just played
+  // private update for the player who just played
   sendHandUpdate(ws, room);
 
-  // public state update to all
+  // public update
   sendState(room);
 }
 
