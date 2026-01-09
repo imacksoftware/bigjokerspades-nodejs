@@ -4,7 +4,7 @@ const { URL } = require("url");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: lobby-v2-start");
+console.log("SERVER VERSION: lobby-v3-start-leave");
 
 const rooms = new Map();
 
@@ -105,6 +105,24 @@ function resetAllReady(room) {
   for (const s of room.seats) s.ready = false;
 }
 
+function abortToLobby(room, reason) {
+  // used when someone leaves during playing (until bots exist)
+  if (room.phase !== "playing") return;
+
+  room.phase = "lobby";
+  room.startedAt = null;
+  resetAllReady(room);
+
+  broadcast(room, {
+    type: "game_aborted",
+    room_id: room.roomId,
+    reason: reason || "player_left",
+    t: Date.now(),
+  });
+
+  sendState(room);
+}
+
 function startGame(room) {
   room.phase = "playing";
   room.startedAt = Date.now();
@@ -178,6 +196,25 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // leave room (client requested)
+    if (msg.type === "leave_room") {
+      // free any seat held by this client
+      leaveSeat(room, ws._clientId);
+
+      // if we were playing, abort back to lobby (for now)
+      abortToLobby(room, "leave_room");
+
+      // tell this client they no longer have a seat
+      sendYouAre(ws, room);
+
+      // update everyone
+      sendState(room);
+
+      // optionally close the socket (clean leave)
+      ws.close();
+      return;
+    }
+
     // seat selection
     if (msg.type === "seat_choose") {
       if (room.phase !== "lobby") {
@@ -215,8 +252,6 @@ wss.on("connection", (ws, req) => {
 
       seat.ready = desired;
       sendState(room);
-
-      // IMPORTANT: start check happens after state_update
       maybeStartGame(room);
       return;
     }
@@ -228,7 +263,13 @@ wss.on("connection", (ws, req) => {
     room.clients.delete(ws);
 
     // free any seat held by this client
+    const wasSeated = Boolean(findSeatForClient(room, ws._clientId));
     leaveSeat(room, ws._clientId);
+
+    // if someone drops during playing, abort back to lobby (until bots)
+    if (wasSeated) {
+      abortToLobby(room, "disconnect");
+    }
 
     if (room.clients.size > 0) {
       sendState(room);
