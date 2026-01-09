@@ -2,9 +2,16 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const { URL } = require("url");
 
+const {
+  defaultConfig,
+  buildDeck,
+  shuffleDeck,
+  deckSummary
+} = require("./functions/deck");
+
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: lobby-v3-start-leave");
+console.log("SERVER VERSION: lobby-v4-m2-deck");
 
 const rooms = new Map();
 
@@ -15,6 +22,8 @@ function makeEmptyRoom(roomId) {
     startedAt: null,
     phase: "lobby", // lobby | playing | complete (later)
     clients: new Set(),
+    config: defaultConfig(),
+    deck: null, // milestone 2: shuffled deck stored here at game start
     seats: [
       { seat: 1, clientId: null, isBot: false, ready: false },
       { seat: 2, clientId: null, isBot: false, ready: false },
@@ -106,11 +115,11 @@ function resetAllReady(room) {
 }
 
 function abortToLobby(room, reason) {
-  // used when someone leaves during playing (until bots exist)
   if (room.phase !== "playing") return;
 
   room.phase = "lobby";
   room.startedAt = null;
+  room.deck = null; // clear deck on abort
   resetAllReady(room);
 
   broadcast(room, {
@@ -129,6 +138,21 @@ function startGame(room) {
 
   // reset lobby readiness per your requirement
   resetAllReady(room);
+
+  // ===== milestone 2: build + shuffle deck, store it =====
+  const built = buildDeck(room.config);
+  room.deck = shuffleDeck(built);
+
+  const summary = deckSummary(room.deck, 8);
+  console.log(`[${room.roomId}] deck built`, summary);
+
+  // optional: send summary to clients for verification (no full deck)
+  broadcast(room, {
+    type: "deck_built",
+    room_id: room.roomId,
+    summary,
+  });
+  // ================================================
 
   broadcast(room, {
     type: "game_started",
@@ -198,19 +222,10 @@ wss.on("connection", (ws, req) => {
 
     // leave room (client requested)
     if (msg.type === "leave_room") {
-      // free any seat held by this client
       leaveSeat(room, ws._clientId);
-
-      // if we were playing, abort back to lobby (for now)
       abortToLobby(room, "leave_room");
-
-      // tell this client they no longer have a seat
       sendYouAre(ws, room);
-
-      // update everyone
       sendState(room);
-
-      // optionally close the socket (clean leave)
       ws.close();
       return;
     }
@@ -262,11 +277,9 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     room.clients.delete(ws);
 
-    // free any seat held by this client
     const wasSeated = Boolean(findSeatForClient(room, ws._clientId));
     leaveSeat(room, ws._clientId);
 
-    // if someone drops during playing, abort back to lobby (until bots)
     if (wasSeated) {
       abortToLobby(room, "disconnect");
     }
