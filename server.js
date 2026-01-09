@@ -6,14 +6,23 @@ const {
   defaultConfig,
   buildDeck,
   shuffleDeck,
-  deckSummary
+  deckSummary,
 } = require("./functions/deck");
 
 const { dealHands } = require("./functions/deal");
+const { determineFirstDealerSeat } = require("./functions/dealer");
+
+const {
+  nextSeatClockwise,
+  leftOfDealer,
+  effectiveSuit,
+  teamForSeat,
+  determineTrickWinner,
+} = require("./functions/trick");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: lobby-v5-m3-deal");
+console.log("SERVER VERSION: playing-v1-m5-trick-engine");
 
 const rooms = new Map();
 
@@ -22,11 +31,24 @@ function makeEmptyRoom(roomId) {
     roomId,
     createdAt: Date.now(),
     startedAt: null,
-    phase: "lobby", // lobby | playing | complete (later)
+    phase: "lobby", // lobby | playing
     clients: new Set(),
+
     config: defaultConfig(),
+
     deck: null,
-    hands: null, // milestone 3: {1:[],2:[],3:[],4:[]}
+    hands: null,
+
+    dealerSeat: null, // milestone 4a
+    spadesBroken: false, // milestone 6 later
+
+    // milestone 5
+    trickIndex: 0, // 1..13 while playing
+    turnSeat: null,
+    currentTrick: null, // { leaderSeat, leadSuit, plays:[{seat, card}] }
+    books: { A: 0, B: 0 },
+    trickHistory: [],
+
     seats: [
       { seat: 1, clientId: null, isBot: false, ready: false },
       { seat: 2, clientId: null, isBot: false, ready: false },
@@ -49,11 +71,33 @@ function broadcast(room, obj) {
   for (const c of room.clients) safeSend(c, obj);
 }
 
+function findSeatForClient(room, clientId) {
+  return room.seats.find((s) => s.clientId === clientId) || null;
+}
+
 function roomPublicState(room) {
   return {
     room_id: room.roomId,
     phase: room.phase,
     started_at: room.startedAt,
+
+    dealer_seat: room.dealerSeat,
+
+    // milestone 5
+    trick_index: room.trickIndex,
+    turn_seat: room.turnSeat,
+    books: room.books,
+    current_trick: room.currentTrick
+      ? {
+          leader_seat: room.currentTrick.leaderSeat,
+          lead_suit: room.currentTrick.leadSuit,
+          plays: room.currentTrick.plays.map((p) => ({
+            seat: p.seat,
+            card_id: p.card.id,
+          })),
+        }
+      : null,
+
     seats: room.seats.map((s) => ({
       seat: s.seat,
       occupied: Boolean(s.clientId) || s.isBot,
@@ -67,10 +111,6 @@ function sendState(room) {
   broadcast(room, { type: "state_update", state: roomPublicState(room) });
 }
 
-function findSeatForClient(room, clientId) {
-  return room.seats.find((s) => s.clientId === clientId) || null;
-}
-
 function sendYouAre(ws, room) {
   const seat = findSeatForClient(room, ws._clientId);
   safeSend(ws, {
@@ -78,6 +118,10 @@ function sendYouAre(ws, room) {
     room_id: room.roomId,
     seat: seat ? seat.seat : null,
   });
+}
+
+function resetAllReady(room) {
+  for (const s of room.seats) s.ready = false;
 }
 
 function leaveSeat(room, clientId) {
@@ -95,7 +139,7 @@ function seatTake(room, seatNumber, clientId) {
   if (!seat) return { ok: false, error: "invalid_seat" };
   if (seat.clientId || seat.isBot) return { ok: false, error: "seat_taken" };
 
-  // changing seats auto-unreadies you: clear any existing seat first
+  // one seat per client
   leaveSeat(room, clientId);
 
   seat.clientId = clientId;
@@ -110,11 +154,9 @@ function allFourSeatsOccupied(room) {
 }
 
 function allFourSeatsReady(room) {
-  return room.seats.every((s) => (Boolean(s.clientId) || s.isBot) && s.ready === true);
-}
-
-function resetAllReady(room) {
-  for (const s of room.seats) s.ready = false;
+  return room.seats.every(
+    (s) => (Boolean(s.clientId) || s.isBot) && s.ready === true
+  );
 }
 
 function abortToLobby(room, reason) {
@@ -124,6 +166,16 @@ function abortToLobby(room, reason) {
   room.startedAt = null;
   room.deck = null;
   room.hands = null;
+
+  room.spadesBroken = false;
+
+  // milestone 5 reset
+  room.trickIndex = 0;
+  room.turnSeat = null;
+  room.currentTrick = null;
+  room.books = { A: 0, B: 0 };
+  room.trickHistory = [];
+
   resetAllReady(room);
 
   broadcast(room, {
@@ -136,9 +188,18 @@ function abortToLobby(room, reason) {
   sendState(room);
 }
 
-/**
- * Send the correct private hand to a client (if seated + hands exist).
- */
+function sendPrivateHand(room, ws, seatNum) {
+  const hand = room.hands?.[seatNum];
+  if (!hand) return;
+
+  safeSend(ws, {
+    type: "hand_update",
+    room_id: room.roomId,
+    seat: seatNum,
+    hand,
+  });
+}
+
 function sendPrivateHandIfAvailable(room, ws) {
   if (room.phase !== "playing") return;
   if (!room.hands) return;
@@ -146,26 +207,37 @@ function sendPrivateHandIfAvailable(room, ws) {
   const seatObj = findSeatForClient(room, ws._clientId);
   if (!seatObj) return;
 
-  const seatNum = seatObj.seat;
-  const hand = room.hands[seatNum];
-  if (!hand) return;
-
-  safeSend(ws, {
-    type: "hand_dealt",
-    room_id: room.roomId,
-    seat: seatNum,
-    hand, // full card objects (your choice B)
-  });
+  sendPrivateHand(room, ws, seatObj.seat);
 }
 
 function startGame(room) {
   room.phase = "playing";
   room.startedAt = Date.now();
+  room.spadesBroken = false;
 
-  // reset lobby readiness per your requirement
+  // reset ready after lock-in
   resetAllReady(room);
 
-  // ===== milestone 2: build + shuffle deck =====
+  // ===== milestone 4a: first diamond deals =====
+  if (room.dealerSeat === null) {
+    const probeDeck = shuffleDeck(buildDeck(room.config));
+    const probe = determineFirstDealerSeat(probeDeck);
+
+    room.dealerSeat = probe.dealer_seat;
+
+    console.log(
+      `[${room.roomId}] first diamond deals -> dealer seat ${room.dealerSeat} (card=${probe.found_card_id}, index=${probe.dealt_index})`
+    );
+
+    broadcast(room, {
+      type: "dealer_determined",
+      room_id: room.roomId,
+      dealer_seat: room.dealerSeat,
+      found_card_id: probe.found_card_id, // debug ok
+    });
+  }
+
+  // ===== milestone 2: build + shuffle (reshuffle) =====
   const built = buildDeck(room.config);
   room.deck = shuffleDeck(built);
 
@@ -177,28 +249,39 @@ function startGame(room) {
     room_id: room.roomId,
     summary,
   });
-  // ============================================
 
-  // ===== milestone 3: deal hands (private) =====
+  // ===== milestone 3: deal hands =====
   room.hands = dealHands(room.deck);
 
-  // public: everyone learns that hands exist (no contents)
   broadcast(room, {
     type: "hands_dealt",
     room_id: room.roomId,
     counts: { 1: 13, 2: 13, 3: 13, 4: 13 },
   });
 
-  // private: only send each client their own seat hand
   for (const clientWs of room.clients) {
     sendPrivateHandIfAvailable(room, clientWs);
   }
-  // ============================================
+
+  // ===== milestone 5: initialize trick engine =====
+  room.trickIndex = 1;
+  room.books = { A: 0, B: 0 };
+  room.trickHistory = [];
+
+  const firstLeader = leftOfDealer(room.dealerSeat);
+  room.currentTrick = {
+    leaderSeat: firstLeader,
+    leadSuit: null, // effective suit
+    plays: [],
+  };
+  room.turnSeat = firstLeader;
 
   broadcast(room, {
     type: "game_started",
     room_id: room.roomId,
     started_at: room.startedAt,
+    first_turn_seat: room.turnSeat,
+    trick_index: room.trickIndex,
   });
 
   sendState(room);
@@ -208,8 +291,140 @@ function maybeStartGame(room) {
   if (room.phase !== "lobby") return;
   if (!allFourSeatsOccupied(room)) return;
   if (!allFourSeatsReady(room)) return;
-
   startGame(room);
+}
+
+function requirePlaying(room, ws) {
+  if (room.phase !== "playing") {
+    safeSend(ws, { type: "error", error: "not_playing" });
+    return false;
+  }
+  return true;
+}
+
+function handlePlayCard(room, ws, cardIdRaw) {
+  if (!requirePlaying(room, ws)) return;
+
+  const seatObj = findSeatForClient(room, ws._clientId);
+  if (!seatObj) {
+    safeSend(ws, { type: "error", error: "no_seat" });
+    return;
+  }
+
+  const seatNum = seatObj.seat;
+
+  if (room.turnSeat !== seatNum) {
+    safeSend(ws, { type: "error", error: "not_your_turn" });
+    return;
+  }
+
+  const cardId = String(cardIdRaw || "").trim();
+  if (!cardId) {
+    safeSend(ws, { type: "error", error: "missing_card_id" });
+    return;
+  }
+
+  const hand = room.hands?.[seatNum];
+  if (!Array.isArray(hand)) {
+    safeSend(ws, { type: "error", error: "hand_missing" });
+    return;
+  }
+
+  const idx = hand.findIndex((c) => c.id === cardId);
+  if (idx === -1) {
+    safeSend(ws, { type: "error", error: "card_not_in_hand" });
+    return;
+  }
+
+  const [card] = hand.splice(idx, 1);
+
+  // apply to current trick
+  if (!room.currentTrick) {
+    room.currentTrick = {
+      leaderSeat: seatNum,
+      leadSuit: null,
+      plays: [],
+    };
+  }
+
+  if (room.currentTrick.plays.length === 0) {
+    room.currentTrick.leaderSeat = seatNum;
+    room.currentTrick.leadSuit = effectiveSuit(card);
+  }
+
+  room.currentTrick.plays.push({ seat: seatNum, card });
+
+  // spades broken tracking for later milestones
+  if (card.is_trump) room.spadesBroken = true;
+
+  broadcast(room, {
+    type: "trick_update",
+    room_id: room.roomId,
+    trick_index: room.trickIndex,
+    turn_seat: room.turnSeat,
+    play: { seat: seatNum, card_id: card.id },
+    lead_suit: room.currentTrick.leadSuit,
+    plays_count: room.currentTrick.plays.length,
+  });
+
+  // if trick complete (4 plays)
+  if (room.currentTrick.plays.length >= 4) {
+    const winnerSeat = determineTrickWinner(room.currentTrick);
+    const winnerTeam = teamForSeat(winnerSeat);
+
+    room.books[winnerTeam] += 1;
+
+    room.trickHistory.push({
+      trick_index: room.trickIndex,
+      lead_suit: room.currentTrick.leadSuit,
+      plays: room.currentTrick.plays.map((p) => ({ seat: p.seat, card_id: p.card.id })),
+      winner_seat: winnerSeat,
+      winner_team: winnerTeam,
+    });
+
+    broadcast(room, {
+      type: "trick_complete",
+      room_id: room.roomId,
+      trick_index: room.trickIndex,
+      winner_seat: winnerSeat,
+      winner_team: winnerTeam,
+      books: room.books,
+      plays: room.currentTrick.plays.map((p) => ({ seat: p.seat, card_id: p.card.id })),
+    });
+
+    // next trick or hand complete
+    if (room.trickIndex >= 13) {
+      broadcast(room, {
+        type: "hand_complete",
+        room_id: room.roomId,
+        books: room.books,
+        t: Date.now(),
+      });
+
+      // return to lobby (dev-friendly loop)
+      abortToLobby(room, "hand_complete");
+      return;
+    }
+
+    room.trickIndex += 1;
+    room.currentTrick = {
+      leaderSeat: winnerSeat,
+      leadSuit: null,
+      plays: [],
+    };
+    room.turnSeat = winnerSeat;
+
+    sendState(room);
+    return;
+  }
+
+  // advance turn
+  room.turnSeat = nextSeatClockwise(room.turnSeat);
+
+  // update just this player's hand
+  sendPrivateHand(room, ws, seatNum);
+
+  sendState(room);
 }
 
 const server = http.createServer((req, res) => {
@@ -243,11 +458,8 @@ wss.on("connection", (ws, req) => {
 
   room.clients.add(ws);
 
-  // initial sync
   sendState(room);
   sendYouAre(ws, room);
-
-  // if someone joins late during playing, and they have a seat, send their hand
   sendPrivateHandIfAvailable(room, ws);
 
   ws.on("message", (raw) => {
@@ -264,7 +476,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // leave room (client requested)
     if (msg.type === "leave_room") {
       leaveSeat(room, ws._clientId);
       abortToLobby(room, "leave_room");
@@ -274,7 +485,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // seat selection
     if (msg.type === "seat_choose") {
       if (room.phase !== "lobby") {
         safeSend(ws, { type: "error", error: "not_in_lobby" });
@@ -294,7 +504,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ready toggle
     if (msg.type === "ready_set") {
       if (room.phase !== "lobby") {
         safeSend(ws, { type: "error", error: "not_in_lobby" });
@@ -312,6 +521,19 @@ wss.on("connection", (ws, req) => {
       seat.ready = desired;
       sendState(room);
       maybeStartGame(room);
+      return;
+    }
+
+    if (msg.type === "play_card") {
+      handlePlayCard(room, ws, msg.card_id);
+      return;
+    }
+
+    if (msg.type === "stay_in_sync") {
+      // always safe: resend public + private info
+      sendState(room);
+      sendYouAre(ws, room);
+      sendPrivateHandIfAvailable(room, ws);
       return;
     }
 
