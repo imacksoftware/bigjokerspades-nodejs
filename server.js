@@ -14,9 +14,11 @@ const {
   determineTrickWinner,
 } = require("./functions/trick");
 
+const bidding = require("./functions/bidding");
+
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
-console.log("SERVER VERSION: milestone-7 (bidding + scoring) + strict legality");
+console.log("SERVER VERSION: milestone-7 (bidding module split) + scoring + strict legality");
 
 const rooms = new Map();
 
@@ -25,7 +27,7 @@ function makeEmptyRoom(roomId) {
     roomId,
     createdAt: Date.now(),
 
-    phase: "lobby", // lobby | bidding | playing | complete
+    phase: "lobby", // lobby | bidding | negotiating | playing | complete
 
     clients: new Set(),
 
@@ -41,15 +43,15 @@ function makeEmptyRoom(roomId) {
       target_score: 500, // 500 default; later: 350/250/custom
       board: 4, // minimum team bid
       min_total_bid: 11, // minimum combined bids across teams
-      first_hand_bids_itself: true,
-      allow_books_made: true, // we’ll wire UI + flow next
+      first_hand_bids_itself: false,
+      allow_books_made: true, // negotiation will use this
     },
 
     // game-level config (deck/trump + legality)
     config: {
       big_joker: "color", // "color" | "bw"
       big_deuce: "D2", // "D2" | "S2"
-      renege_enabled: false, // milestone 7 still strict (OFF)
+      renege_enabled: false, // strict legality (OFF)
     },
 
     // match state
@@ -74,8 +76,9 @@ function makeEmptyRoom(roomId) {
 
     trickHistory: [],
 
-    // bidding state (only used when phase === "bidding")
-    bidding: null, // init per bidding-hand
+    // bidding + negotiation
+    bidding: null, // used in bidding + negotiating
+    negotiation: null, // used in negotiating
     final_bids: null, // {A:number, B:number} stored once bidding locks
   };
 }
@@ -95,14 +98,6 @@ function broadcast(room, obj) {
 
 function findSeatForClient(room, clientId) {
   return room.seats.find((s) => s.clientId === clientId) || null;
-}
-
-function computeTeamTotalsFromPicks(picks) {
-  const a1 = Number(picks?.[1] ?? 0);
-  const a3 = Number(picks?.[3] ?? 0);
-  const b2 = Number(picks?.[2] ?? 0);
-  const b4 = Number(picks?.[4] ?? 0);
-  return { A: a1 + a3, B: b2 + b4 };
 }
 
 function dealingTeam(room) {
@@ -160,10 +155,18 @@ function roomPublicState(room) {
           lock_order: room.bidding.lock_order,
           must_confirm_team: room.bidding.must_confirm_team,
           needs_min_total_resolution: room.bidding.needs_min_total_resolution,
+
+          // negotiation helpers (safe to expose; UI can ignore for now)
+          min_picks: room.bidding.min_picks ?? null,
+          locked_teams: room.bidding.locked_teams ?? null,
+          editable_team: room.bidding.editable_team ?? null,
+
           min_total_bid: room.match_config.min_total_bid,
           board: room.match_config.board,
         }
       : null,
+
+    negotiation: room.negotiation ?? null,
 
     final_bids: room.final_bids,
   };
@@ -252,6 +255,7 @@ function abortToLobby(room, reason) {
   room.trickHistory = [];
 
   room.bidding = null;
+  room.negotiation = null;
   room.final_bids = null;
 
   resetAllReady(room);
@@ -260,20 +264,28 @@ function abortToLobby(room, reason) {
   sendState(room);
 }
 
-function initBidding(room) {
-  const nonDeal = nonDealingTeam(room);
-  const deal = dealingTeam(room);
+function enterPlayingFromBids(room, teamTotals) {
+  room.final_bids = { ...teamTotals };
+  room.bidding = null;
+  room.negotiation = null;
 
-  room.bidding = {
-    picks: { 1: null, 2: null, 3: null, 4: null },
-    team_totals: { A: 0, B: 0 },
-    confirmed: { A: false, B: false },
-    lock_order: [nonDeal, deal], // non-dealing locks first
-    must_confirm_team: nonDeal, // enforced
-    needs_min_total_resolution: false,
-  };
+  room.phase = "playing";
+  room.trick_index = 1;
 
-  room.final_bids = null;
+  const firstLeader = leftOfDealer(room.dealer_seat);
+  room.current_trick = { leaderSeat: firstLeader, leadSuit: null, plays: [] };
+  room.turn_seat = firstLeader;
+
+  broadcast(room, {
+    type: "bidding_complete",
+    room_id: room.roomId,
+    hand_number: room.hand_number,
+    final_bids: room.final_bids,
+    dealer_seat: room.dealer_seat,
+    first_turn_seat: room.turn_seat,
+  });
+
+  sendState(room);
 }
 
 function startHand(room) {
@@ -290,15 +302,22 @@ function startHand(room) {
   room.turn_seat = null;
 
   room.final_bids = null;
+  room.negotiation = null;
+
+  // ✅ send hands immediately so players always see cards before bidding/playing UI
+  for (const clientWs of room.clients) {
+    sendHandUpdate(clientWs, room);
+    sendYouAre(clientWs, room);
+  }
 
   // hand 1 bids itself?
-  const isFirstHand = room.hand_number === 1 && room.match_config.first_hand_bids_itself;
+  const isFirstHand =
+    room.hand_number === 1 && room.match_config.first_hand_bids_itself;
 
   if (isFirstHand) {
     room.phase = "playing";
     room.bidding = null;
 
-    // first leader = left of dealer
     const firstLeader = leftOfDealer(room.dealer_seat);
     room.trick_index = 1;
     room.current_trick = { leaderSeat: firstLeader, leadSuit: null, plays: [] };
@@ -314,18 +333,12 @@ function startHand(room) {
     });
 
     sendState(room);
-
-    for (const clientWs of room.clients) {
-      sendHandUpdate(clientWs, room);
-      sendYouAre(clientWs, room);
-    }
-
     return;
   }
 
   // normal bidding hand
   room.phase = "bidding";
-  initBidding(room);
+  bidding.initBidding(room, { nonDealingTeam, dealingTeam });
 
   broadcast(room, {
     type: "hand_started",
@@ -337,12 +350,6 @@ function startHand(room) {
   });
 
   sendState(room);
-
-  // send hands now (server-authoritative; later we can hide during bidding if desired)
-  for (const clientWs of room.clients) {
-    sendHandUpdate(clientWs, room);
-    sendYouAre(clientWs, room);
-  }
 }
 
 function startMatch(room) {
@@ -371,8 +378,8 @@ function rotateDealer(room) {
 }
 
 function finishHandAndAdvance(room) {
-  // scoring
-  const isFirstHand = room.hand_number === 1 && room.match_config.first_hand_bids_itself;
+  const isFirstHand =
+    room.hand_number === 1 && room.match_config.first_hand_bids_itself;
 
   let deltaA = 0;
   let deltaB = 0;
@@ -495,128 +502,8 @@ function checkLegality(room, hand, card, isLeaderPlay) {
   return { ok: true };
 }
 
-function requirePhase(room, ws, phase) {
-  if (room.phase !== phase) {
-    safeSend(ws, { type: "error", error: `not_in_${phase}` });
-    return false;
-  }
-  return true;
-}
-
-function handleBidSet(room, ws, bidRaw) {
-  if (!requirePhase(room, ws, "bidding")) return;
-
-  const seatObj = findSeatForClient(room, ws._clientId);
-  if (!seatObj) return safeSend(ws, { type: "error", error: "no_seat" });
-
-  const seatNum = seatObj.seat;
-
-  const bid = Number(bidRaw);
-  if (!Number.isFinite(bid) || bid < 0 || bid > 13) {
-    return safeSend(ws, { type: "error", error: "invalid_bid" });
-  }
-
-  // if team already confirmed, disallow changes (simple + safe)
-  const team = teamForSeat(seatNum);
-  if (room.bidding.confirmed[team]) {
-    return safeSend(ws, { type: "error", error: "team_already_confirmed" });
-  }
-
-  room.bidding.picks[seatNum] = bid;
-  room.bidding.team_totals = computeTeamTotalsFromPicks(room.bidding.picks);
-
-  sendState(room);
-}
-
-function handleBidConfirm(room, ws) {
-  if (!requirePhase(room, ws, "bidding")) return;
-
-  const seatObj = findSeatForClient(room, ws._clientId);
-  if (!seatObj) return safeSend(ws, { type: "error", error: "no_seat" });
-
-  const seatNum = seatObj.seat;
-  const team = teamForSeat(seatNum);
-
-  // enforce lock order: non-dealing team must confirm first
-  if (team !== room.bidding.must_confirm_team) {
-    return safeSend(ws, { type: "error", error: "not_your_team_turn_to_confirm" });
-  }
-
-  // both teammates must have picks
-  const teammateSeat = team === "A" ? (seatNum === 1 ? 3 : 1) : (seatNum === 2 ? 4 : 2);
-  const myPick = room.bidding.picks[seatNum];
-  const matePick = room.bidding.picks[teammateSeat];
-
-  if (myPick === null || myPick === undefined || matePick === null || matePick === undefined) {
-    return safeSend(ws, { type: "error", error: "both_teammates_must_pick" });
-  }
-
-  // team total must be >= board
-  room.bidding.team_totals = computeTeamTotalsFromPicks(room.bidding.picks);
-  const teamTotal = room.bidding.team_totals[team] || 0;
-  const board = Number(room.match_config.board || 4);
-
-  if (teamTotal < board) {
-    return safeSend(ws, { type: "error", error: "team_bid_below_board" });
-  }
-
-  // lock it
-  room.bidding.confirmed[team] = true;
-
-  // advance lock order
-  const [first, second] = room.bidding.lock_order;
-  room.bidding.must_confirm_team = team === first ? second : null;
-
-  sendState(room);
-
-  // if both confirmed, validate min total
-  if (room.bidding.confirmed.A && room.bidding.confirmed.B) {
-    const minTotal = Number(room.match_config.min_total_bid || 11);
-    const total = (room.bidding.team_totals.A || 0) + (room.bidding.team_totals.B || 0);
-
-    if (total < minTotal) {
-      // we stop here until we implement the “increase / books made” prompt flow
-      room.bidding.needs_min_total_resolution = true;
-
-      broadcast(room, {
-        type: "bidding_needs_min_total_resolution",
-        room_id: room.roomId,
-        total_bid: total,
-        min_total_bid: minTotal,
-        team_totals: room.bidding.team_totals,
-      });
-
-      sendState(room);
-      return;
-    }
-
-    // bidding complete -> lock final bids
-    room.final_bids = { ...room.bidding.team_totals };
-    room.bidding = null;
-
-    // enter play
-    room.phase = "playing";
-    room.trick_index = 1;
-
-    const firstLeader = leftOfDealer(room.dealer_seat);
-    room.current_trick = { leaderSeat: firstLeader, leadSuit: null, plays: [] };
-    room.turn_seat = firstLeader;
-
-    broadcast(room, {
-      type: "bidding_complete",
-      room_id: room.roomId,
-      hand_number: room.hand_number,
-      final_bids: room.final_bids,
-      dealer_seat: room.dealer_seat,
-      first_turn_seat: room.turn_seat,
-    });
-
-    sendState(room);
-  }
-}
-
 function handlePlayCard(room, ws, cardIdRaw) {
-  if (!requirePhase(room, ws, "playing")) return;
+  if (room.phase !== "playing") return safeSend(ws, { type: "error", error: "not_in_playing" });
 
   const seatObj = findSeatForClient(room, ws._clientId);
   if (!seatObj) return safeSend(ws, { type: "error", error: "no_seat" });
@@ -702,7 +589,6 @@ function handlePlayCard(room, ws, cardIdRaw) {
         t: Date.now(),
       });
 
-      // advance match loop
       finishHandAndAdvance(room);
       return;
     }
@@ -723,6 +609,29 @@ function handlePlayCard(room, ws, cardIdRaw) {
   sendHandUpdate(ws, room);
 
   sendState(room);
+}
+
+function biddingHelpers(room) {
+  return {
+    // comms/state
+    safeSend,
+    broadcast,
+    sendState,
+
+    // seat/team helpers
+    teamForSeat,
+    findSeatForClient,
+
+    // dealer/team helpers (for lock order)
+    nonDealingTeam,
+    dealingTeam,
+
+    // transition
+    enterPlayingFromBids: (r, totals) => enterPlayingFromBids(r, totals),
+
+    // (placeholders you’ll inject when you move negotiation scoring into bidding.js)
+    // resolveBooksMadeHand: (r, totals) => { ... },
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -816,17 +725,21 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ===== bidding messages =====
+    // ===== bidding messages (delegated) =====
     if (msg.type === "bid_set") {
-      handleBidSet(room, ws, msg.bid);
+      bidding.handleBidSet(room, ws, msg.bid, biddingHelpers(room));
       return;
     }
 
     if (msg.type === "bid_confirm") {
-      handleBidConfirm(room, ws);
+      bidding.handleBidConfirm(room, ws, biddingHelpers(room));
       return;
     }
-    // ===========================
+    // ======================================
+
+    // NOTE: negotiation message types will be added once you paste that logic into functions/bidding.js
+    // if (msg.type === "negotiation_choice") { ... }
+    // if (msg.type === "negotiation_response") { ... }
 
     if (msg.type === "play_card") {
       handlePlayCard(room, ws, msg.card_id);
