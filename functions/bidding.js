@@ -74,11 +74,7 @@ function biddingPublicState(room) {
     lock_order: b.lock_order,
     must_confirm_team: b.must_confirm_team,
     needs_min_total_resolution: b.needs_min_total_resolution,
-    negotiation: b.negotiation
-      ? {
-          ...b.negotiation,
-        }
-      : null,
+    negotiation: b.negotiation ? { ...b.negotiation } : null,
     min_total_bid: room.match_config?.min_total_bid ?? 11,
     board: room.match_config?.board ?? 4,
   };
@@ -97,7 +93,7 @@ function enterNegotiation(room, helpers) {
   room.bidding.min_picks = { ...room.bidding.picks };
 
   room.bidding.negotiation = {
-    stage: "choose", // choose | one_books_waiting_accept | both_increase_relock
+    stage: "choose", // choose | one_books_waiting_accept | both_increase_relock | resolved_books_made
     choices: { A: null, B: null }, // 'books_made' | 'increase'
     books_made_team: null,
     increasing_team: null,
@@ -409,13 +405,11 @@ function handleNegotiationResponse(room, ws, acceptRaw, helpers) {
 
 /**
  * If both chose increase, teams re-lock with bid_confirm.
- * When they both confirm again, we either:\n
- * - proceed to play if >= min_total\n
- * - or we remain in negotiating and force another increase round\n
+ * When they both confirm again, we either:
+ * - proceed to play if >= min_total
+ * - or we remain in negotiating and force another increase round
  */
 function maybeFinalizeAfterBothIncreaseRelock(room, helpers) {
-  // This helper is optional: if you call it from server.js after bid_confirm,
-  // it will handle the “still below min” loop automatically.
   if (room.phase !== "negotiating") return;
   const b = room.bidding;
   const n = b?.negotiation;
@@ -428,7 +422,6 @@ function maybeFinalizeAfterBothIncreaseRelock(room, helpers) {
   const total = Number(b.team_totals.A ?? 0) + Number(b.team_totals.B ?? 0);
 
   if (total >= minTotal) {
-    // bidding resolved -> enter play
     const finalBids = { ...b.team_totals };
     room.final_bids = { ...finalBids };
     room.bidding = null;
@@ -444,7 +437,7 @@ function maybeFinalizeAfterBothIncreaseRelock(room, helpers) {
     return;
   }
 
-  // still below: start another increase round
+  // still below: start another choose round
   b.negotiation.stage = "choose";
   b.negotiation.choices = { A: null, B: null };
   b.negotiation.books_made_team = null;
@@ -456,7 +449,6 @@ function maybeFinalizeAfterBothIncreaseRelock(room, helpers) {
   // baseline updated to current picks to enforce “increase only” from here
   b.min_picks = { ...b.picks };
 
-  // reset locks and enforce non-dealing confirms first when they come back around
   const nonDeal = helpers.nonDealingTeam(room);
   b.confirmed = { A: false, B: false };
   b.lock_order = [nonDeal, nonDeal === "A" ? "B" : "A"];
@@ -486,4 +478,3 @@ module.exports = {
 
   maybeFinalizeAfterBothIncreaseRelock,
 };
-
