@@ -67,10 +67,25 @@ function determineTrickWinner(trick) {
   return best.seat;
 }
 
+/**
+ * Create a fresh trick object.
+ *
+ * server uses this for `room.current_trick`.
+ * UI can display it even before the first play.
+ */
+function startTrick(leaderSeat = null) {
+  return {
+    leaderSeat: leaderSeat === undefined ? null : leaderSeat,
+    leadSuit: null,
+    plays: [],
+  };
+}
+
 module.exports = {
   nextSeatClockwise,
   leftOfDealer,
   effectiveSuit,
   teamForSeat,
+  startTrick,
   determineTrickWinner,
 };

@@ -1,156 +1,30 @@
-/**
- * Big Joker Spades WS Server
- * server.js
- *
- * - bidding + negotiation logic lives in functions/bidding.js
- * - server delegates ws messages to bidding module
- */
+// server.js
+const http = require('http');
+const { WebSocketServer } = require('ws');
 
-const http = require("http");
-const WebSocket = require("ws");
-const url = require("url");
-const crypto = require("crypto");
-
-const { buildDeck, shuffleDeck } = require("./functions/deck");
-const { dealHands } = require("./functions/deal");
-const { determineFirstDealerSeat } = require("./functions/dealer");
-const trick = require("./functions/trick");
-
-const bidding = require("./functions/bidding");
+// root-level requires (IMPORTANT)
+const deck = require('./functions/deck');
+const deal = require('./functions/deal');
+const dealer = require('./functions/dealer');
+const trick = require('./functions/trick');
+const bidding = require('./functions/bidding');
 
 const PORT = Number(process.env.PORT || 3001);
 
-// =====================================================
-// in-memory rooms
-// =====================================================
 const rooms = new Map(); // roomId -> room object
 
-function uid() {
-  return crypto.randomBytes(12).toString("hex");
-}
-
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
-}
-
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+function safeJsonSend(ws, obj) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify(obj));
 }
 
-function broadcast(room, obj) {
-  const msg = JSON.stringify(obj);
-  room.clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-  });
-}
-
-function teamForSeat(seatNum) {
-  // 1+3 = A, 2+4 = B
-  if (seatNum === 1 || seatNum === 3) return "A";
-  if (seatNum === 2 || seatNum === 4) return "B";
-  return null;
-}
-
-function dealingTeam(room) {
-  return teamForSeat(room.dealer_seat);
-}
-
-function nonDealingTeam(room) {
-  const d = dealingTeam(room);
-  return d === "A" ? "B" : "A";
-}
-
-function findSeatForClient(room, clientId) {
-  for (const [seatStr, seat] of Object.entries(room.seats)) {
-    if (seat && seat.clientId === clientId) {
-      return { seat: Number(seatStr), seatObj: seat };
-    }
+function broadcastRoom(room, obj) {
+  for (const s of [1, 2, 3, 4]) {
+    const seat = room.seats[s];
+    if (seat?.ws) safeJsonSend(seat.ws, obj);
   }
-  return null;
 }
 
-function rotateDealer(room) {
-  room.dealer_seat = room.dealer_seat % 4 === 0 ? 1 : room.dealer_seat + 1;
-}
-
-// =====================================================
-// room template
-// =====================================================
-function makeEmptyRoom(roomId) {
-  return {
-    roomId,
-
-    // connected ws clients
-    clients: new Set(),
-
-    // seat state
-    seats: {
-      1: null,
-      2: null,
-      3: null,
-      4: null,
-    },
-
-    // match config + game config
-    match_config: {
-      target_score: 500,
-      board: 4,
-      min_total_bid: 11,
-      // if true: first hand is allowed to bid itself, so books_made is NOT available on first hand
-      // if false: first hand does NOT bid itself, so books_made is available if negotiation happens on first hand
-      first_hand_bids_itself: true,
-    },
-
-    config: {
-      // UI sorting config (your existing UI reads these)
-      big_joker: "color", // "color" | "bw"
-      big_deuce: "D2", // "D2" | "S2"
-    },
-
-    // match state
-    match: {
-      target_score: 500,
-      hand_number: 0,
-      score: { A: 0, B: 0 },
-    },
-
-    // hand state
-    hand_number: 0,
-    phase: "lobby", // lobby | bidding | negotiating | playing | complete
-
-    dealer_seat: 1,
-    turn_seat: null,
-    spades_broken: false,
-
-    books: { A: 0, B: 0 },
-
-    // cards
-    deck: [],
-    hands: { 1: [], 2: [], 3: [], 4: [] },
-
-    // trick state (shape consumed by your UI)
-    current_trick: {
-      leaderSeat: null,
-      leadSuit: null,
-      plays: [],
-    },
-    trick_index: 0,
-    trick_history: [],
-
-    // bidding state (owned by functions/bidding.js)
-    bidding: null,
-    final_bids: null,
-  };
-}
-
-// =====================================================
-// public state for UI
-// =====================================================
 function roomPublicState(room) {
   return {
     room_id: room.roomId,
@@ -170,385 +44,294 @@ function roomPublicState(room) {
     },
 
     current_trick: room.current_trick,
-
     trick_history: room.trick_history,
 
     config: room.config,
     match_config: room.match_config,
 
-    // IMPORTANT: UI negotiation panel reads negotiation inside state.bidding
+    // UI reads negotiation under state.bidding.negotiation
     bidding: bidding.biddingPublicState(room),
   };
 }
 
-function sendState(room) {
-  broadcast(room, { type: "state_update", state: roomPublicState(room) });
+function getOrCreateRoom(roomId) {
+  if (rooms.has(roomId)) return rooms.get(roomId);
+
+  const room = {
+    roomId,
+
+    // phases: lobby -> bidding (negotiation later) -> playing (not implemented here)
+    phase: 'lobby',
+
+    // seats: { 1:{ws,ready}, ... }
+    seats: {
+      1: { ws: null, ready: false },
+      2: { ws: null, ready: false },
+      3: { ws: null, ready: false },
+      4: { ws: null, ready: false },
+    },
+
+    // game state
+    dealer_seat: null,
+    turn_seat: null,
+    trick_index: 0,
+    spades_broken: false,
+
+    books: { A: 0, B: 0 },
+
+    match: {
+      score: { A: 0, B: 0 },
+      target_score: 500,
+    },
+
+    hand_number: 0,
+
+    current_trick: { leaderSeat: null, leadSuit: null, plays: [] },
+    trick_history: [],
+
+    config: {
+      big_joker: 'color', // "color" | "bw"
+      big_deuce: 'D2',    // "D2" | "S2"
+    },
+
+    match_config: {
+      target_score: 500,
+      board: 4,
+      first_hand_bids_itself: true,
+    },
+
+    // per-seat hands
+    hands: {
+      1: [],
+      2: [],
+      3: [],
+      4: [],
+    },
+
+    bidding: null,
+  };
+
+  rooms.set(roomId, room);
+  return room;
 }
 
-// =====================================================
-// per-seat hand updates
-// =====================================================
+function findSeatByWs(room, ws) {
+  for (const s of [1, 2, 3, 4]) {
+    if (room.seats[s].ws === ws) return s;
+  }
+  return null;
+}
+
+function sendState(room) {
+  broadcastRoom(room, { type: 'state_update', state: roomPublicState(room) });
+}
+
 function sendHandToSeat(room, seatNum) {
   const seat = room.seats[seatNum];
-  if (!seat) return;
-
-  const ws = seat.ws;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  safeSend(ws, {
-    type: "hand_update",
+  if (!seat?.ws) return;
+  safeJsonSend(seat.ws, {
+    type: 'hand_update',
     seat: seatNum,
-    hand: room.hands?.[seatNum] || [],
+    hand: room.hands[seatNum] || [],
   });
 }
 
-function sendHands(room) {
+function allSeatedAndReady(room) {
+  for (const s of [1, 2, 3, 4]) {
+    if (!room.seats[s].ws) return false;
+    if (!room.seats[s].ready) return false;
+  }
+  return true;
+}
+
+function startNewHand(room) {
+  room.hand_number += 1;
+  room.phase = 'bidding';
+
+  // create + shuffle deck
+  const d = deck.buildDeck(room.config);
+  const shuffled = deck.shuffleDeck(d);
+
+  // choose dealer seat based on big deuce
+  const bigDeuceId = room.config.big_deuce || 'D2';
+  const found = dealer.determineFirstDealerSeat(shuffled, bigDeuceId);
+
+  room.dealer_seat = found.dealer_seat;
+  room.turn_seat = null;
+
+  // deal hands
+  const hands = deal.dealHands(shuffled);
+  room.hands[1] = hands['1'] || [];
+  room.hands[2] = hands['2'] || [];
+  room.hands[3] = hands['3'] || [];
+  room.hands[4] = hands['4'] || [];
+
+  // reset trick
+  room.trick_index = 0;
+  room.current_trick = trick.startTrick();
+  room.trick_history = [];
+  room.spades_broken = false;
+  room.books = { A: 0, B: 0 };
+
+  // init bidding
+  room.bidding = bidding.initBidding(room);
+
+  // push state + each seat’s hand
+  sendState(room);
   [1, 2, 3, 4].forEach((s) => sendHandToSeat(room, s));
 }
 
-// =====================================================
-// start / advance game
-// =====================================================
-function enterPlayingFromBids(room, finalBids) {
-  room.final_bids = { ...finalBids };
-  room.phase = "playing";
-
-  room.trick_index = 0;
-  room.books = { A: 0, B: 0 };
-  room.spades_broken = false;
-
-  // leader is left of dealer to start
-  const firstLeader = room.dealer_seat % 4 === 0 ? 1 : room.dealer_seat + 1;
-  room.turn_seat = firstLeader;
-
-  room.current_trick = {
-    leaderSeat: firstLeader,
-    leadSuit: null,
-    plays: [],
-  };
-
-  sendState(room);
-  sendHands(room);
-}
-
-/**
- * normal hand scoring path (after 13 tricks) is already in your codebase.
- * books made is special: end immediately + score + advance.
- */
-function resolveBooksMadeHand(room, finalBids) {
-  const bidA = Number(finalBids?.A ?? 0);
-  const bidB = Number(finalBids?.B ?? 0);
-
-  const delta = { A: 10 * bidA, B: 10 * bidB };
-
-  room.match.score.A += delta.A;
-  room.match.score.B += delta.B;
-
-  broadcast(room, {
-    type: "hand_scored",
-    hand_number: room.hand_number,
-    mode: "books_made",
-    final_bids: { A: bidA, B: bidB },
-    delta,
-    new_score: { ...room.match.score },
-  });
-
-  broadcast(room, {
-    type: "hand_complete",
-    hand_number: room.hand_number,
-    books: { ...room.books },
-    final_bids: { A: bidA, B: bidB },
-    mode: "books_made",
-  });
-
-  const target = Number(room.match.target_score ?? 500);
-  const winner =
-    room.match.score.A >= target ? "A" :
-    room.match.score.B >= target ? "B" :
-    null;
-
-  if (winner) {
-    room.phase = "complete";
-    broadcast(room, { type: "match_complete", winner_team: winner, reason: "target_score_reached" });
-    sendState(room);
-    return;
-  }
-
-  // advance to next hand
-  rotateDealer(room);
-  room.hand_number += 1;
-  startHand(room);
-}
-
-function startHand(room) {
-  room.phase = "bidding";
-  room.hand_number += 1;
-  room.match.hand_number = room.hand_number;
-
-  room.final_bids = null;
-
-  // build + shuffle deck
-  const deck = shuffleDeck(buildDeck(room.config));
-  room.deck = deck;
-
-  // determine dealer (first hand only)
-  if (room.hand_number === 1) {
-    const probeDeck = shuffleDeck(buildDeck(room.config));
-    const seat = determineFirstDealerSeat(probeDeck);
-    room.dealer_seat = seat;
-  }
-
-  // deal
-  const hands = dealHands(deck);
-  room.hands = hands;
-
-  // init trick state
-  room.trick_index = 0;
-  room.books = { A: 0, B: 0 };
-  room.spades_broken = false;
-
-  room.turn_seat = null;
-  room.current_trick = {
-    leaderSeat: null,
-    leadSuit: null,
-    plays: [],
-  };
-  room.trick_history = [];
-
-  // init bidding state (delegated module)
-  bidding.initBidding(room, { nonDealingTeam, dealingTeam });
-
-  broadcast(room, { type: "hand_started", hand_number: room.hand_number, dealer_seat: room.dealer_seat });
-
-  sendState(room);
-  sendHands(room);
-}
-
-function everyoneReady(room) {
-  const seats = Object.values(room.seats);
-  if (seats.some((s) => !s)) return false;
-  return seats.every((s) => !!s.ready);
-}
-
 function maybeStartFromLobby(room) {
-  if (room.phase !== "lobby") return;
-  if (!everyoneReady(room)) return;
-  startHand(room);
+  if (room.phase !== 'lobby') return;
+  if (!allSeatedAndReady(room)) return;
+  startNewHand(room);
 }
 
-// =====================================================
-// bidding helpers passed into functions/bidding.js
-// =====================================================
-function biddingHelpers(room) {
-  return {
-    safeSend,
-    broadcast,
-    sendState,
-
-    findSeatForClient: (r, clientId) => findSeatForClient(r, clientId),
-    teamForSeat,
-
-    dealingTeam,
-    nonDealingTeam,
-
-    enterPlayingFromBids,
-    resolveBooksMadeHand,
-  };
-}
-
-// =====================================================
-// WS server
-// =====================================================
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Big Joker Spades WS server\n");
+  res.end('Big Joker Spades WS server\n');
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (ws, req) => {
-  const parsed = url.parse(req.url, true);
-  const roomId = String(parsed.query?.room || "").trim();
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const roomId = url.searchParams.get('room');
+
   if (!roomId) {
-    safeSend(ws, { type: "error", error: "missing_room" });
-    ws.close();
+    socket.destroy();
     return;
   }
 
-  let room = rooms.get(roomId);
-  if (!room) {
-    room = makeEmptyRoom(roomId);
-    rooms.set(roomId, room);
-  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws._roomId = roomId;
+    wss.emit('connection', ws, req);
+  });
+});
 
-  // attach client id
-  const clientId = uid();
-  ws._clientId = clientId;
+wss.on('connection', (ws) => {
+  const roomId = ws._roomId;
+  const room = getOrCreateRoom(roomId);
 
-  room.clients.add(ws);
+  // initial seat info
+  safeJsonSend(ws, { type: 'you_are', seat: null });
+  safeJsonSend(ws, { type: 'state_update', state: roomPublicState(room) });
 
-  // initial state
-  safeSend(ws, { type: "you_are", seat: null });
-  safeSend(ws, { type: "state_update", state: roomPublicState(room) });
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      safeJsonSend(ws, { type: 'error', error: 'invalid_json' });
+      return;
+    }
 
-  ws.on("message", (buf) => {
-    const msg = safeJsonParse(String(buf));
-    if (!msg || !msg.type) return;
+    const type = msg?.type;
+    const mySeat = findSeatByWs(room, ws);
 
-    // shorthand
-    const type = msg.type;
-
-    // seat choose
-    if (type === "seat_choose") {
-      if (room.phase !== "lobby") {
-        safeSend(ws, { type: "error", error: "not_in_lobby" });
+    // --- core lobby controls ---
+    if (type === 'seat_choose') {
+      const wanted = Number(msg.seat);
+      if (![1, 2, 3, 4].includes(wanted)) {
+        safeJsonSend(ws, { type: 'error', error: 'invalid_seat' });
         return;
       }
 
-      const seatNum = Number(msg.seat);
-      if (![1, 2, 3, 4].includes(seatNum)) {
-        safeSend(ws, { type: "error", error: "invalid_seat" });
+      // if already seated elsewhere, free old seat
+      if (mySeat && mySeat !== wanted) {
+        room.seats[mySeat].ws = null;
+        room.seats[mySeat].ready = false;
+      }
+
+      // must be empty
+      if (room.seats[wanted].ws && room.seats[wanted].ws !== ws) {
+        safeJsonSend(ws, { type: 'error', error: 'seat_taken' });
         return;
       }
 
-      if (room.seats[seatNum]) {
-        safeSend(ws, { type: "error", error: "seat_taken" });
-        return;
-      }
+      room.seats[wanted].ws = ws;
+      room.seats[wanted].ready = false;
 
-      // unseat from any old seat
-      for (const s of [1, 2, 3, 4]) {
-        if (room.seats[s] && room.seats[s].clientId === clientId) {
-          room.seats[s] = null;
-        }
-      }
-
-      room.seats[seatNum] = { clientId, ws, ready: false, kind: "human" };
-
-      safeSend(ws, { type: "you_are", seat: seatNum });
+      safeJsonSend(ws, { type: 'you_are', seat: wanted });
       sendState(room);
       return;
     }
 
-    // ready
-    if (type === "ready_set") {
-      const seatObj = findSeatForClient(room, clientId);
-      if (!seatObj) {
-        safeSend(ws, { type: "error", error: "no_seat" });
+    if (type === 'ready_set') {
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
         return;
       }
-      room.seats[seatObj.seat].ready = !!msg.ready;
+      room.seats[mySeat].ready = !!msg.ready;
       sendState(room);
       maybeStartFromLobby(room);
       return;
     }
 
-    // leave
-    if (type === "leave_room") {
-      for (const s of [1, 2, 3, 4]) {
-        if (room.seats[s] && room.seats[s].clientId === clientId) {
-          room.seats[s] = null;
-        }
+    if (type === 'leave_room') {
+      if (mySeat) {
+        room.seats[mySeat].ws = null;
+        room.seats[mySeat].ready = false;
       }
-      safeSend(ws, { type: "you_are", seat: null });
+      safeJsonSend(ws, { type: 'you_are', seat: null });
       sendState(room);
       return;
     }
 
-    // resync hand
-    if (type === "stay_in_sync") {
-      const seatObj = findSeatForClient(room, clientId);
-      if (seatObj) sendHandToSeat(room, seatObj.seat);
-      safeSend(ws, { type: "state_update", state: roomPublicState(room) });
+    if (type === 'stay_in_sync') {
+      safeJsonSend(ws, { type: 'state_update', state: roomPublicState(room) });
+      if (mySeat) sendHandToSeat(room, mySeat);
       return;
     }
 
-    // ======================================
-    // bidding delegation
-    // ======================================
-    if (type === "bid_set") {
-      bidding.handleBidSet(room, ws, msg.bid, biddingHelpers(room));
-      return;
-    }
+    // --- bidding ---
+    if (type === 'bid_set') {
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
+        return;
+      }
+      const bidVal = msg.bid;
 
-    if (type === "bid_confirm") {
-      bidding.handleBidConfirm(room, ws, biddingHelpers(room));
-      // if the negotiation path is "both teams increase", finalization / re-loop happens once BOTH teams re-lock
-      bidding.maybeFinalizeAfterBothIncreaseRelock(room, biddingHelpers(room));
-      return;
-    }
-
-    if (type === "negotiation_choice") {
-      bidding.handleNegotiationChoice(room, ws, msg.choice, biddingHelpers(room));
-      return;
-    }
-
-    if (type === "negotiation_response") {
-      bidding.handleNegotiationResponse(room, ws, msg.accept, biddingHelpers(room));
-      return;
-    }
-
-    // ======================================
-    // playing (card play)
-    // ======================================
-    if (type === "play_card") {
-      if (room.phase !== "playing") {
-        safeSend(ws, { type: "error", error: "not_in_playing" });
+      const r = bidding.handleBidSet(room, mySeat, bidVal);
+      if (!r.ok) {
+        safeJsonSend(ws, { type: 'error', error: r.error });
         return;
       }
 
-      const seatObj = findSeatForClient(room, clientId);
-      if (!seatObj) {
-        safeSend(ws, { type: "error", error: "no_seat" });
-        return;
-      }
-
-      const seatNum = seatObj.seat;
-
-      if (Number(room.turn_seat) !== Number(seatNum)) {
-        safeSend(ws, { type: "error", error: "not_your_turn" });
-        return;
-      }
-
-      const cardId = msg.card_id;
-
-      // delegate legality + state mutation to trick module
-      try {
-        trick.playCard(room, seatNum, cardId);
-      } catch (e) {
-        safeSend(ws, { type: "error", error: e?.message || "play_error" });
-        return;
-      }
-
-      // after play, sync all state
       sendState(room);
-      sendHands(room);
       return;
     }
 
-    safeSend(ws, { type: "error", error: "unknown_message_type" });
+    if (type === 'bid_confirm') {
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
+        return;
+      }
+
+      const r = bidding.handleBidConfirm(room, mySeat);
+      if (!r.ok) {
+        safeJsonSend(ws, { type: 'error', error: r.error });
+        return;
+      }
+
+      sendState(room);
+      return;
+    }
+
+    // unknown
+    safeJsonSend(ws, { type: 'error', error: 'unknown_message_type' });
   });
 
-  ws.on("close", () => {
-    room.clients.delete(ws);
-
-    // remove seat if occupied
-    for (const s of [1, 2, 3, 4]) {
-      if (room.seats[s] && room.seats[s].clientId === clientId) {
-        room.seats[s] = null;
-      }
-    }
-
-    sendState(room);
-
-    // optional: garbage collect empty rooms
-    if (room.clients.size === 0) {
-      rooms.delete(roomId);
+  ws.on('close', () => {
+    const seat = findSeatByWs(room, ws);
+    if (seat) {
+      room.seats[seat].ws = null;
+      room.seats[seat].ready = false;
+      sendState(room);
     }
   });
 });
 
 server.listen(PORT, () => {
-  // eslint-disable-next-line no-console
   console.log(`Big Joker Spades WS server running on ws://localhost:${PORT}`);
 });
