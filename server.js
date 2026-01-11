@@ -60,7 +60,7 @@ function getOrCreateRoom(roomId) {
   const room = {
     roomId,
 
-    // phases: lobby -> bidding (negotiation later) -> playing (not implemented here)
+    // phases: lobby -> bidding -> negotiating -> playing (you can wire playing later)
     phase: 'lobby',
 
     // seats: { 1:{ws,ready}, ... }
@@ -98,6 +98,8 @@ function getOrCreateRoom(roomId) {
       target_score: 500,
       board: 4,
       first_hand_bids_itself: true,
+      // optional override:
+      // min_total_bid: 11,
     },
 
     // per-seat hands
@@ -109,6 +111,7 @@ function getOrCreateRoom(roomId) {
     },
 
     bidding: null,
+    final_bids: null, // set when bidding/negotiation resolves
   };
 
   rooms.set(roomId, room);
@@ -147,6 +150,7 @@ function allSeatedAndReady(room) {
 function startNewHand(room) {
   room.hand_number += 1;
   room.phase = 'bidding';
+  room.final_bids = null;
 
   // create + shuffle deck
   const d = deck.buildDeck(room.config);
@@ -284,15 +288,14 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // --- bidding ---
+    // --- bidding + negotiating ---
     if (type === 'bid_set') {
       if (!mySeat) {
         safeJsonSend(ws, { type: 'error', error: 'not_seated' });
         return;
       }
-      const bidVal = msg.bid;
 
-      const r = bidding.handleBidSet(room, mySeat, bidVal);
+      const r = bidding.handleBidSet(room, mySeat, msg.bid);
       if (!r.ok) {
         safeJsonSend(ws, { type: 'error', error: r.error });
         return;
@@ -315,6 +318,41 @@ wss.on('connection', (ws) => {
       }
 
       sendState(room);
+      return;
+    }
+
+    // negotiation choices
+    if (type === 'negotiation_choice') {
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
+        return;
+      }
+
+      const r = bidding.handleNegotiationChoice(room, mySeat, msg.choice);
+      if (!r.ok) {
+        safeJsonSend(ws, { type: 'error', error: r.error });
+        return;
+      }
+
+      sendState(room);
+      maybeAutoResolveNegotiation(room);
+      return;
+    }
+
+    if (type === 'negotiation_response') {
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
+        return;
+      }
+
+      const r = bidding.handleNegotiationResponse(room, mySeat, msg.accept);
+      if (!r.ok) {
+        safeJsonSend(ws, { type: 'error', error: r.error });
+        return;
+      }
+
+      sendState(room);
+      maybeAutoResolveNegotiation(room);
       return;
     }
 
