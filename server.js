@@ -209,8 +209,13 @@ function validatePlayLegality(room, seat, card) {
 }
 
 function scorePlayedHand(room) {
-  const bids = room.final_bids || { A: 0, B: 0 };
   const books = room.books || { A: 0, B: 0 };
+
+  // ✅ first hand bids itself: bid == books made (bags always 0)
+  const bids =
+    (!room.final_bids && shouldFirstHandBidItself(room))
+      ? { A: Number(books.A ?? 0), B: Number(books.B ?? 0) }
+      : (room.final_bids || { A: 0, B: 0 });
 
   function teamDelta(team) {
     const bid = Number(bids[team] ?? 0);
@@ -255,8 +260,6 @@ function scorePlayedHand(room) {
 
 function startNewHand(room) {
   room.hand_number += 1;
-  room.phase = 'bidding';
-  room.final_bids = null;
 
   // create + shuffle deck
   const d = deck.buildDeck(room.config);
@@ -267,7 +270,6 @@ function startNewHand(room) {
   const found = dealer.determineFirstDealerSeat(shuffled, bigDeuceId);
 
   room.dealer_seat = found.dealer_seat;
-  room.turn_seat = null;
 
   // deal hands
   const hands = deal.dealHands(shuffled);
@@ -276,19 +278,41 @@ function startNewHand(room) {
   room.hands[3] = hands['3'] || [];
   room.hands[4] = hands['4'] || [];
 
-  // reset trick
+  // reset trick/hand state
   room.trick_index = 0;
   room.current_trick = trick.startTrick();
   room.trick_history = [];
   room.spades_broken = false;
   room.books = { A: 0, B: 0 };
 
-  // init bidding
+  // reset bids
+  room.final_bids = null;
+  room.bidding = null;
+
+  // ✅ if first hand bids itself -> skip bidding entirely
+  if (shouldFirstHandBidItself(room)) {
+    room.phase = 'playing';
+
+    const first = trick.leftOfDealer(room.dealer_seat);
+    room.turn_seat = first;
+    room.current_trick = trick.startTrick(first);
+
+    sendState(room);
+    [1, 2, 3, 4].forEach((s) => sendHandToSeat(room, s));
+    return;
+  }
+
+  // normal flow
+  room.phase = 'bidding';
+  room.turn_seat = null;
   room.bidding = bidding.initBidding(room);
 
-  // push state + each seat’s hand
   sendState(room);
   [1, 2, 3, 4].forEach((s) => sendHandToSeat(room, s));
+}
+
+function shouldFirstHandBidItself(room) {
+  return !!room?.match_config?.first_hand_bids_itself && Number(room.hand_number) === 1;
 }
 
 function ensurePlayingTurnInitialized(room) {
