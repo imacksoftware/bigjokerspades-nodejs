@@ -191,6 +191,25 @@ function maybeStartFromLobby(room) {
   startNewHand(room);
 }
 
+function maybeAutoResolveNegotiation(room) {
+  // only do anything if we're negotiating
+  if (room.phase !== 'negotiating') return;
+
+  // if both teams picked books_made, bidding.js marks negotiation as resolved
+  if (bidding.negotiationIsResolvedBooksMade(room)) {
+    // apply score (based on current team_totals)
+    const r = bidding.scoreBooksMadeHand(room);
+    if (!r?.ok) {
+      // if something unexpected happens, don't crash the server
+      console.error('scoreBooksMadeHand failed:', r?.error);
+      return;
+    }
+
+    // immediately start next hand (keeps game flowing)
+    startNewHand(room);
+  }
+}
+
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end('Big Joker Spades WS server\n');
