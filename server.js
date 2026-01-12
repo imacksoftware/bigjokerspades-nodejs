@@ -119,6 +119,7 @@ function getOrCreateRoom(roomId) {
       board: 4,
       first_hand_bids_itself: true,
       renege_on: true,               // if true, legality is NOT enforced
+      bot_takeover_on_disconnect: false,
       // optional override:
       // min_total_bid: 11,
 
@@ -127,6 +128,7 @@ function getOrCreateRoom(roomId) {
       bags_penalty_at: 10,            // common: every 10 bags
       bags_penalty_points: 100,       // common: -100
       ten_for_two_enabled: true,      // >=10 bid special
+
     },
 
     // per-seat hands
@@ -889,12 +891,46 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     const seat = findSeatByWs(room, ws);
-    if (seat) {
-      room.seats[seat].ws = null;
-      room.seats[seat].ready = false;
+    if (!seat) return;
+
+    // clear socket
+    room.seats[seat].ws = null;
+    room.seats[seat].ready = false;
+
+    // only enforce during active gameplay phases
+    const activePhases = new Set(['bidding', 'negotiating', 'playing']);
+    if (!activePhases.has(room.phase)) {
       sendState(room);
+      return;
     }
+
+    const takeover = !!room?.match_config?.bot_takeover_on_disconnect;
+
+    // DEFAULT OFF => forfeit
+    if (!takeover) {
+      const forfeitingTeam = seatToTeam(seat);
+      const winnerTeam = otherTeam(forfeitingTeam);
+
+      broadcastRoom(room, {
+        type: 'match_complete',
+        winner_team: winnerTeam || 'tie',
+        reason: 'forfeit_disconnect',
+        forfeiting_team: forfeitingTeam,
+        forfeiting_seat: seat,
+        final_score: room.match?.score,
+      });
+
+      // freeze the room so nothing continues after match_complete
+      room.phase = 'complete';
+      sendState(room);
+      return;
+    }
+
+    // later (milestone 6): bot takeover path
+    sendState(room);
   });
+
+
 });
 
 server.listen(PORT, () => {
