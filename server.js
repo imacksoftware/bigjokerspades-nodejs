@@ -46,13 +46,24 @@ function roomPublicState(room) {
     },
 
     current_trick: room.current_trick,
-    trick_history: room.trick_history,
+    trick_history: (room.trick_history || []).map(t => ({
+      ...t,
+      renege_calls: (room.renege?.calls || []).filter(c =>
+        Number(c.hand_number) === Number(room.hand_number) &&
+        Number(c.trick_index) === Number(t.trick_index)
+      ),
+    })),
 
     config: room.config,
     match_config: room.match_config,
 
     // UI reads negotiation under state.bidding.negotiation
     bidding: bidding.biddingPublicState(room),
+
+    renege: {
+      adjustment: room.renege?.adjustment || { A: 0, B: 0 },
+      calls: room.renege?.calls || [],
+    },
   };
 }
 
@@ -107,7 +118,7 @@ function getOrCreateRoom(roomId) {
       target_score: 500,
       board: 4,
       first_hand_bids_itself: true,
-      renege_on: false,               // if true, legality is NOT enforced
+      renege_on: true,               // if true, legality is NOT enforced
       // optional override:
       // min_total_bid: 11,
 
@@ -244,11 +255,14 @@ function validatePlayLegality(room, seat, card) {
 }
 
 function validateAndApplyRenegeCall(room, accuserSeat, payload) {
-  // payload: { hand_number, trick_index, accused_seat, play_index? }
-
   ensureRenegeState(room);
 
   if (room.phase !== 'playing') return { ok: false, error: 'not_in_playing' };
+
+  // once all 13 tricks are recorded, lock renege calls for this hand
+  if (Array.isArray(room.trick_history) && room.trick_history.length >= 13) {
+    return { ok: false, error: 'hand_already_complete' };
+  }
 
   const accSeat = Number(accuserSeat);
   const accusedSeat = Number(payload?.accused_seat);
@@ -258,23 +272,21 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   if (![1, 2, 3, 4].includes(accSeat)) return { ok: false, error: 'invalid_accuser_seat' };
   if (![1, 2, 3, 4].includes(accusedSeat)) return { ok: false, error: 'invalid_accused_seat' };
 
-  // must accuse opposing team
   const accTeam = seatToTeam(accSeat);
   const accusedTeam = seatToTeam(accusedSeat);
   if (!accTeam || !accusedTeam) return { ok: false, error: 'invalid_team' };
   if (accTeam === accusedTeam) return { ok: false, error: 'cannot_accuse_own_team' };
 
-  // limit: max 3 renege calls per team per hand
-  const accTeamCalls = room.renege.calls.filter(c =>
-    Number(c.hand_number) === handNumber && c.accuser_team === accTeam
-  ).length;
-
-  if (accTeamCalls >= 3) return { ok: false, error: 'renege_call_limit_reached_for_team' };
-
-  // hand must match current hand
+  // validate hand number
   if (!Number.isFinite(handNumber) || handNumber !== Number(room.hand_number)) {
     return { ok: false, error: 'invalid_hand_number' };
   }
+
+  // max 3 renege calls per accuser team per hand
+  const accTeamCalls = room.renege.calls.filter(c =>
+    Number(c.hand_number) === handNumber && c.accuser_team === accTeam
+  ).length;
+  if (accTeamCalls >= 3) return { ok: false, error: 'renege_call_limit_reached_for_team' };
 
   // trick must exist and be completed (in history)
   if (!Number.isFinite(trickIndex) || trickIndex < 0 || trickIndex > 12) {
@@ -284,7 +296,6 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   const trickRow = room.trick_history?.find(t => Number(t.trick_index) === trickIndex);
   if (!trickRow) return { ok: false, error: 'trick_not_found_or_not_completed' };
 
-  // must have a lead suit to claim renege (always true for completed tricks, but safe)
   const leadSuit = trickRow.lead_suit;
   if (!leadSuit) return { ok: false, error: 'trick_missing_lead_suit' };
 
@@ -295,45 +306,22 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   const hasPlayIndex = playIndexRaw !== null && playIndexRaw !== undefined;
   if (!hasPlayIndex) return { ok: false, error: 'missing_play_index' };
 
-  // prevent duplicate calls for the same hand/trick/accused/play_index
+  const pi = Number(playIndexRaw);
+  if (!Number.isFinite(pi) || pi < 0 || pi > 3) return { ok: false, error: 'invalid_play_index' };
+
+  // prevent duplicates for same hand/trick/accused/play_index
   const existing = room.renege.calls.find(c =>
     Number(c.hand_number) === handNumber &&
     Number(c.trick_index) === trickIndex &&
     Number(c.accused_seat) === accusedSeat &&
-    Number(c.play_index) === Number(playIndexRaw)
+    Number(c.play_index) === pi
   );
   if (existing) return { ok: false, error: 'renege_already_called_for_this_target' };
 
-  // identify accused play row
-  let accusedPlay = null;
-
-  if (hasPlayIndex) {
-    const pi = Number(playIndexRaw);
-    if (!Number.isFinite(pi) || pi < 0 || pi > 3) return { ok: false, error: 'invalid_play_index' };
-    if (pi === 0) return { ok: false, error: 'cannot_accuse_trick_leader' };
-
-    accusedPlay = plays[pi];
-    if (!accusedPlay || Number(accusedPlay.seat) !== accusedSeat) {
-      return { ok: false, error: 'play_index_does_not_match_accused_seat' };
-    }
-  } else {
-    // fallback: find the one play by accused seat (should be exactly 1)
-    accusedPlay = plays.find(p => Number(p.seat) === accusedSeat);
-    if (!accusedPlay) return { ok: false, error: 'accused_play_not_found' };
+  const accusedPlay = plays[pi];
+  if (!accusedPlay || Number(accusedPlay.seat) !== accusedSeat) {
+    return { ok: false, error: 'play_index_does_not_match_accused_seat' };
   }
-
-  // if renege_on is enabled (free-play), accusations should be disabled
-  // (spec says accusations are part of renege system; simplest is: no renege calls when renege_on=true)
-  if (isRenegeOn(room)) return { ok: false, error: 'renege_calls_disabled_when_renege_on' };
-
-  // evaluate renege using stored proof boolean
-  // confirmed renege if:
-  // - accused did NOT follow lead suit (their played effective suit != lead_suit)
-  // - AND they HAD lead suit in hand before play (had_led_suit_before_play === true)
-  //
-  // confirmed renege if:
-  // - accused did NOT follow lead suit (their played effective suit != lead_suit)
-  // - AND they HAD lead suit in hand before play (had_led_suit_before_play === true)
 
   const playedEffSuit = accusedPlay.played_eff_suit;
   if (!playedEffSuit) return { ok: false, error: 'missing_played_eff_suit' };
@@ -341,48 +329,34 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   const hadLed = accusedPlay.had_led_suit_before_play === true;
   const isOffSuit = String(playedEffSuit) !== String(leadSuit);
 
-  const confirmedRenege = (hadLed && isOffSuit);
+  const confirmedRenege = hadLed && isOffSuit;
 
-  // compute adjustment:
-  // confirmed renege -> accuser team gains +3 effective tricks
-  // false accusation -> accuser team loses -3 effective tricks
   const deltaTeam = accTeam;
   const delta = confirmedRenege ? +3 : -3;
 
   applyRenegeDelta(room, deltaTeam, delta);
 
-  // persist the call record
   const callId = room.renege.next_id++;
   const record = {
     id: callId,
     ts: Date.now(),
-
     hand_number: handNumber,
     trick_index: trickIndex,
-
     accuser_seat: accSeat,
     accuser_team: accTeam,
-
     accused_seat: accusedSeat,
     accused_team: accusedTeam,
-
-    play_index: hasPlayIndex ? Number(playIndexRaw) : null,
-
+    play_index: pi,
     lead_suit: leadSuit,
     played_eff_suit: playedEffSuit,
     had_led_suit_before_play: accusedPlay.had_led_suit_before_play,
-
     confirmed: confirmedRenege,
     delta_tricks: delta,
   };
 
   room.renege.calls.push(record);
 
-  return {
-    ok: true,
-    record,
-    adjustment: room.renege.adjustment,
-  };
+  return { ok: true, record, adjustment: room.renege.adjustment };
 }
 
 function scorePlayedHand(room) {
