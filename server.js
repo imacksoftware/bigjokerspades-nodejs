@@ -112,6 +112,9 @@ function getOrCreateRoom(roomId) {
 
     bidding: null,
     final_bids: null, // set when bidding/negotiation resolves
+
+    // NEW: store most recent hand summary so reconnects can see it
+    last_hand_summary: null,
   };
 
   rooms.set(roomId, room);
@@ -192,20 +195,54 @@ function maybeStartFromLobby(room) {
 }
 
 function maybeAutoResolveNegotiation(room) {
-  // only do anything if we're negotiating
   if (room.phase !== 'negotiating') return;
 
-  // if both teams picked books_made, bidding.js marks negotiation as resolved
   if (bidding.negotiationIsResolvedBooksMade(room)) {
-    // apply score (based on current team_totals)
+    // capture score before
+    const before = {
+      A: Number(room.match.score.A ?? 0),
+      B: Number(room.match.score.B ?? 0),
+    };
+
+    // apply score
     const r = bidding.scoreBooksMadeHand(room);
     if (!r?.ok) {
-      // if something unexpected happens, don't crash the server
       console.error('scoreBooksMadeHand failed:', r?.error);
       return;
     }
 
-    // immediately start next hand (keeps game flowing)
+    // capture score after
+    const after = {
+      A: Number(room.match.score.A ?? 0),
+      B: Number(room.match.score.B ?? 0),
+    };
+
+    // build summary (single source of truth for UI)
+    const b = room.bidding;
+    const summary = {
+      room_id: room.roomId,
+      hand_number: room.hand_number,
+      mode: 'books_made',
+      board: b?.board ?? room.match_config?.board ?? null,
+      min_total_bid: b?.min_total_bid ?? null,
+
+      picks: b?.picks ?? null,
+      team_bids: {
+        A: Number(b?.team_totals?.A ?? 0),
+        B: Number(b?.team_totals?.B ?? 0),
+      },
+
+      delta: r.delta ?? { A: 0, B: 0 },
+
+      score_before: before,
+      score_after: after,
+    };
+
+    // store for reconnect + broadcast before new hand starts
+    room.last_hand_summary = summary;
+    broadcastRoom(room, { type: 'hand_summary', summary });
+
+    // IMPORTANT: start next hand immediately after summary broadcast
     startNewHand(room);
   }
 }
@@ -239,6 +276,10 @@ wss.on('connection', (ws) => {
   // initial seat info
   safeJsonSend(ws, { type: 'you_are', seat: null });
   safeJsonSend(ws, { type: 'state_update', state: roomPublicState(room) });
+
+  if (room.last_hand_summary) {
+    safeJsonSend(ws, { type: 'hand_summary', summary: room.last_hand_summary });
+  }
 
   ws.on('message', (raw) => {
     let msg;
