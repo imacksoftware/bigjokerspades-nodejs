@@ -8,6 +8,7 @@ const deal = require('./functions/deal');
 const dealer = require('./functions/dealer');
 const trick = require('./functions/trick');
 const bidding = require('./functions/bidding');
+const scoring = require('./functions/scoring');
 
 const PORT = Number(process.env.PORT || 3001);
 
@@ -82,7 +83,7 @@ function getOrCreateRoom(roomId) {
 
     match: {
       score: { A: 0, B: 0 },
-      bags: { A: 0, B: 0 }, // <— add
+      bags: { A: 0, B: 0 },
       target_score: 500,
     },
 
@@ -105,7 +106,7 @@ function getOrCreateRoom(roomId) {
       // min_total_bid: 11,
 
       // scoring toggles (lock these later)
-      bags_enabled: true,
+      bags_enabled: false,
       bags_penalty_at: 10,            // common: every 10 bags
       bags_penalty_points: 100,       // common: -100
       ten_for_two_enabled: true,      // >=10 bid special
@@ -209,53 +210,30 @@ function validatePlayLegality(room, seat, card) {
 }
 
 function scorePlayedHand(room) {
+  const bids = room.final_bids || { A: 0, B: 0 };
   const books = room.books || { A: 0, B: 0 };
 
-  // ✅ first hand bids itself: bid == books made (bags always 0)
-  const bids =
-    (!room.final_bids && shouldFirstHandBidItself(room))
-      ? { A: Number(books.A ?? 0), B: Number(books.B ?? 0) }
-      : (room.final_bids || { A: 0, B: 0 });
+  const cfg = room.match_config || {};
 
-  function teamDelta(team) {
-    const bid = Number(bids[team] ?? 0);
-    const made = Number(books[team] ?? 0);
+  const res = scoring.scoreHand({
+    bidA: Number(bids.A ?? 0),
+    bidB: Number(bids.B ?? 0),
+    madeA: Number(books.A ?? 0),
+    madeB: Number(books.B ?? 0),
+    match: room.match,
+    cfg,
+  });
 
-    if (made >= bid) {
-      const bags = made - bid;
-      return { delta: (bid * 10) + bags, bags_add: bags };
-    }
-    return { delta: -(bid * 10), bags_add: 0 };
-  }
+  // apply to match
+  room.match.score.A = Number(room.match.score.A ?? 0) + res.delta.A;
+  room.match.score.B = Number(room.match.score.B ?? 0) + res.delta.B;
 
-  const a = teamDelta('A');
-  const b = teamDelta('B');
-
-  // apply score
-  room.match.score.A = Number(room.match.score.A ?? 0) + a.delta;
-  room.match.score.B = Number(room.match.score.B ?? 0) + b.delta;
-
-  // apply bags (optional rule: -100 per 10 bags)
+  // bags update (scoring.js already applied the bag-penalty rollover)
   if (!room.match.bags) room.match.bags = { A: 0, B: 0 };
-  room.match.bags.A = Number(room.match.bags.A ?? 0) + a.bags_add;
-  room.match.bags.B = Number(room.match.bags.B ?? 0) + b.bags_add;
+  room.match.bags.A = res.bags.A;
+  room.match.bags.B = res.bags.B;
 
-  // standard bags penalty
-  while (room.match.bags.A >= 10) {
-    room.match.bags.A -= 10;
-    room.match.score.A -= 100;
-  }
-  while (room.match.bags.B >= 10) {
-    room.match.bags.B -= 10;
-    room.match.score.B -= 100;
-  }
-
-  return {
-    ok: true,
-    mode: 'played',
-    delta: { A: a.delta, B: b.delta },
-    detail: { bids, books, bags: room.match.bags },
-  };
+  return { ok: true, mode: 'played', ...res };
 }
 
 function startNewHand(room) {
@@ -342,6 +320,25 @@ function endHandAndMaybeStartNext(room, scoredResult, meta = {}) {
     bags: room.match.bags,
     detail: scoredResult.detail,
   });
+
+  // HARD RULE: first hand bids itself → 10+ books ends match immediately
+  const firstHandAuto =
+    room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
+
+  if (firstHandAuto) {
+    const aBooks = Number(room.books?.A ?? 0);
+    const bBooks = Number(room.books?.B ?? 0);
+
+    if (aBooks >= 10 || bBooks >= 10) {
+      broadcastRoom(room, {
+        type: 'match_complete',
+        winner_team: aBooks === bBooks ? 'tie' : (aBooks > bBooks ? 'A' : 'B'),
+        reason: 'first_hand_10plus_books',
+        final_score: room.match.score,
+      });
+      return;
+    }
+  }
 
   const target = Number(room.match.target_score ?? 500);
   const a = Number(room.match.score.A ?? 0);
@@ -643,12 +640,37 @@ wss.on('connection', (ws) => {
       const handIsOver = (room.trick_history.length >= 13); // 13 tricks
 
       if (handIsOver) {
-        const r = scorePlayedHand(room);
+        
+        const isFirstHandBidsItself =
+          room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
+
+        let r;
+
+        if (isFirstHandBidsItself) {
+          const delta = {
+            A: Number(room.books.A ?? 0) * 10,
+            B: Number(room.books.B ?? 0) * 10,
+          };
+
+          room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
+          room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
+
+          r = {
+            ok: true,
+            mode: 'first_hand_bids_itself',
+            delta,
+            bags: room.match.bags,
+            detail: { books: room.books },
+          };
+        } else {
+          r = scorePlayedHand(room); // now uses scoring.js (bubble/bags)
+        }
+
         if (!r?.ok) {
           console.error('scorePlayedHand failed:', r?.error);
           return;
         }
-        endHandAndMaybeStartNext(room, r, { mode: 'played' });
+        endHandAndMaybeStartNext(room, r);
         return;
       }
 

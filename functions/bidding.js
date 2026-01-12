@@ -1,4 +1,5 @@
 // functions/bidding.js
+const scoring = require('./scoring');
 
 function computeMinTotalBidFromBoard(board) {
   // classic “board” minimum (4 => 11)
@@ -454,8 +455,6 @@ function handleNegotiationResponse(room, seat, acceptRaw) {
   resolveToPlaying(room);
   return { ok: true };
 }
-
-const scoring = require('./scoring');
 
 function scoreBooksMadeHand(room) {
   const b = room?.bidding;
