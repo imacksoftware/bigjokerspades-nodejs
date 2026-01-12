@@ -455,42 +455,36 @@ function handleNegotiationResponse(room, seat, acceptRaw) {
   return { ok: true };
 }
 
+const scoring = require('./scoring');
+
 function scoreBooksMadeHand(room) {
-  // using classic spades scoring:
-  // - if team makes its bid: +10 * bid + bags
-  // - if team fails: -10 * bid
-  // NOTE: this is the standard rule; if your big joker spades uses a different rule,
-  // tell me and I’ll swap it.
   const b = room?.bidding;
   if (!b) return { ok: false, error: 'no_bidding_state' };
 
-  // you already store team_totals as the team bids
   const bidA = Number(b.team_totals?.A ?? 0);
   const bidB = Number(b.team_totals?.B ?? 0);
 
-  // "books made" means they are declaring they'll take exactly their bid.
-  // so tricks made == bid for each team.
+  // books-made means made == bid
   const madeA = bidA;
   const madeB = bidB;
 
-  function teamDelta(bid, made) {
-    if (made >= bid) {
-      const bags = made - bid;
-      return (bid * 10) + bags;
-    }
-    return -(bid * 10);
-  }
+  const cfg = room.match_config || {};
+  const res = scoring.scoreHand({
+    bidA, bidB,
+    madeA, madeB,
+    match: room.match,
+    cfg,
+  });
 
-  const delta = {
-    A: teamDelta(bidA, madeA),
-    B: teamDelta(bidB, madeB),
-  };
+  room.match.score.A = Number(room.match.score.A ?? 0) + res.delta.A;
+  room.match.score.B = Number(room.match.score.B ?? 0) + res.delta.B;
 
-  // apply to match score
-  room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
-  room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
+  // bags update
+  if (!room.match.bags) room.match.bags = { A: 0, B: 0 };
+  room.match.bags.A = res.bags.A;
+  room.match.bags.B = res.bags.B;
 
-  return { ok: true, delta, bid: { A: bidA, B: bidB }, made: { A: madeA, B: madeB } };
+  return { ok: true, mode: 'books_made', ...res };
 }
 
 function negotiationIsResolvedBooksMade(room) {

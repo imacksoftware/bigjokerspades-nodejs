@@ -82,6 +82,7 @@ function getOrCreateRoom(roomId) {
     match: {
       score: { A: 0, B: 0 },
       target_score: 500,
+      bags: { A: 0, B: 0 }, // <— add
     },
 
     hand_number: 0,
@@ -100,6 +101,12 @@ function getOrCreateRoom(roomId) {
       first_hand_bids_itself: true,
       // optional override:
       // min_total_bid: 11,
+
+      // scoring toggles (lock these later)
+      bags_enabled: true,
+      bags_penalty_at: 10,       // common: every 10 bags
+      bags_penalty_points: 100,  // common: -100
+      ten_for_two_enabled: true, // >=10 bid special
     },
 
     // per-seat hands
@@ -188,6 +195,42 @@ function startNewHand(room) {
   [1, 2, 3, 4].forEach((s) => sendHandToSeat(room, s));
 }
 
+function endHandAndMaybeStartNext(room, scoredResult, meta = {}) {
+  broadcastRoom(room, {
+    type: 'hand_complete',
+    hand_number: room.hand_number,
+    mode: meta.mode || 'played',
+    books: room.books,
+    final_bids: room.final_bids,
+  });
+
+  broadcastRoom(room, {
+    type: 'hand_scored',
+    hand_number: room.hand_number,
+    mode: scoredResult.mode || meta.mode || 'played',
+    delta: scoredResult.delta,
+    score: room.match.score,
+    bags: room.match.bags,
+    detail: scoredResult.detail,
+  });
+
+  const target = Number(room.match.target_score ?? 500);
+  const a = Number(room.match.score.A ?? 0);
+  const b = Number(room.match.score.B ?? 0);
+
+  if (a >= target || b >= target) {
+    broadcastRoom(room, {
+      type: 'match_complete',
+      winner_team: a === b ? 'tie' : (a > b ? 'A' : 'B'),
+      reason: 'target_score',
+      final_score: room.match.score,
+    });
+    return;
+  }
+
+  startNewHand(room);
+}
+
 function maybeStartFromLobby(room) {
   if (room.phase !== 'lobby') return;
   if (!allSeatedAndReady(room)) return;
@@ -242,8 +285,7 @@ function maybeAutoResolveNegotiation(room) {
     room.last_hand_summary = summary;
     broadcastRoom(room, { type: 'hand_summary', summary });
 
-    // IMPORTANT: start next hand immediately after summary broadcast
-    startNewHand(room);
+    endHandAndMaybeStartNext(room, r, { mode: 'books_made' });
   }
 }
 
