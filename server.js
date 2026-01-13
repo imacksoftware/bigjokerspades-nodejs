@@ -247,6 +247,25 @@ function isBotSeat(room, seatNum) {
   return !!s && !!s.is_bot && !s.ws;
 }
 
+const TRICK_END_DELAY_MS = 900; // tune this (700–1200 feels good)
+
+function trickEndSig(room) {
+  return [
+    room.phase,
+    room.hand_number,
+    room.trick_index,
+    room.current_trick?.plays?.length || 0,
+  ].join('|');
+}
+
+function clearBetweenTrickPending(room) {
+  if (room?._betweenTrickTimer) {
+    clearTimeout(room._betweenTrickTimer);
+    room._betweenTrickTimer = null;
+  }
+  room._betweenTrickSig = null;
+}
+
 function scheduleBotAct(room) {
   if (!room) return;
   if (room._botTickScheduled) return;
@@ -405,20 +424,64 @@ function maybeBotAct(room) {
       return pa - pb;
     });
 
-    const card = candidates[0];
-    const r = playCardForSeat(room, turn, card.id);
-    if (!r.ok) {
-      // if something unexpected happens, try another card once
-      const alt = candidates[1];
-      if (alt) playCardForSeat(room, turn, alt.id);
+    // don't schedule if one is already pending
+    if (room._botPendingTimer) {
+      room._botLoopGuard = 0;
+      return;
     }
 
+    const chosen = candidates[0];
+    const sig = botSig(room);
+
+    room._botPendingSig = sig;
+    room._botPendingTimer = setTimeout(() => {
+      room._botPendingTimer = null;
+
+      // drop stale actions if anything changed
+      if (botSig(room) !== sig) return;
+
+      const r = playCardForSeat(room, turn, chosen.id);
+      if (!r.ok) {
+        // try once more if the first choice failed unexpectedly
+        const alt = candidates[1];
+        if (alt && botSig(room) === sig) {
+          playCardForSeat(room, turn, alt.id);
+        }
+      }
+    }, botThinkMs(room, 'playing'));
+
     room._botLoopGuard = 0;
-    scheduleBotAct(room);
     return;
   }
 
   room._botLoopGuard = 0;
+}
+
+function botThinkMs(room, phase) {
+  // tune these
+  if (phase === 'playing') return 600 + Math.floor(Math.random() * 700); // 600–1300ms
+  if (phase === 'bidding') return 250 + Math.floor(Math.random() * 400); // 250–650ms
+  if (phase === 'negotiating') return 300 + Math.floor(Math.random() * 500); // 300–800ms
+  return 200;
+}
+
+// a tiny "state signature" so we can drop stale bot actions safely
+function botSig(room) {
+  return [
+    room.phase,
+    room.hand_number,
+    room.trick_index,
+    room.turn_seat,
+    room.current_trick?.plays?.length || 0
+  ].join('|');
+}
+
+function clearBotPending(room) {
+  if (room?._botPendingTimer) {
+    clearTimeout(room._botPendingTimer);
+    room._botPendingTimer = null;
+  }
+  room._botPendingSig = null;
 }
 
 function teamSeats(team) {
@@ -757,6 +820,7 @@ function scorePlayedHand(room) {
 }
 
 function startNewHand(room) {
+  clearBetweenTrickPending(room);
   room.hand_number += 1;
 
   // create + shuffle deck
