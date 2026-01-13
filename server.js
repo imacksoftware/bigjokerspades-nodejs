@@ -1087,10 +1087,12 @@ wss.on('connection', (ws) => {
       }
 
       room.seats[wanted].ws = ws;
-      room.seats[wanted].ready = false;
+      room.seats[wanted].ready = true;
 
       safeJsonSend(ws, { type: 'you_are', seat: wanted });
+      sendHandToSeat(room, wanted);
       sendState(room);
+      maybeStartFromLobby(room); // ✅ in case this was the last needed seat
       return;
     }
 
@@ -1185,6 +1187,17 @@ wss.on('connection', (ws) => {
     if (type === 'stay_in_sync') {
       safeJsonSend(ws, { type: 'state_update', state: roomPublicState(room) });
       if (mySeat) sendHandToSeat(room, mySeat);
+      return;
+    }
+
+    if (type === 'hand_sync') {
+      // client asks: "send me my current hand, if i'm seated"
+      if (!mySeat) {
+        safeJsonSend(ws, { type: 'error', error: 'not_seated' });
+        return;
+      }
+
+      sendHandToSeat(room, mySeat);
       return;
     }
 
