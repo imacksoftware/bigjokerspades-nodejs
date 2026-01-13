@@ -130,8 +130,7 @@ function getOrCreateRoom(roomId) {
       first_hand_bids_itself: false,
       renege_on: true,               // if true, legality is NOT enforced
       bot_takeover_on_disconnect: false,
-      // optional override:
-      // min_total_bid: 11,
+      min_total_bid: 11,
 
       // scoring toggles (lock these later)
       bags_enabled: false,

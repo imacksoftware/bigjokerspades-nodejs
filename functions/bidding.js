@@ -501,6 +501,3 @@ module.exports = {
   scoreBooksMadeHand,
   negotiationIsResolvedBooksMade,
 };
-
-
-
