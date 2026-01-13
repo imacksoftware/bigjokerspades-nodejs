@@ -15,6 +15,8 @@ const PORT = Number(process.env.PORT || 3001);
 
 const rooms = new Map(); // roomId -> room object
 
+const DISCONNECT_GRACE_MS = 30_000; // ← 30 seconds (tweak here)
+
 function safeJsonSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return; // ✅ use WebSocket.OPEN
   ws.send(JSON.stringify(obj));
@@ -87,10 +89,30 @@ function roomPublicState(room) {
     },
 
     seats_public: {
-      1: { occupied: !!room.seats[1].ws || !!room.seats[1].is_bot, is_bot: !!room.seats[1].is_bot, ready: !!room.seats[1].ready },
-      2: { occupied: !!room.seats[2].ws || !!room.seats[2].is_bot, is_bot: !!room.seats[2].is_bot, ready: !!room.seats[2].ready },
-      3: { occupied: !!room.seats[3].ws || !!room.seats[3].is_bot, is_bot: !!room.seats[3].is_bot, ready: !!room.seats[3].ready },
-      4: { occupied: !!room.seats[4].ws || !!room.seats[4].is_bot, is_bot: !!room.seats[4].is_bot, ready: !!room.seats[4].ready },
+      1: {
+        occupied: !!room.seats[1].ws || !!room.seats[1].is_bot,
+        is_bot: !!room.seats[1].is_bot,
+        ready: !!room.seats[1].ready,
+        hand_count: (room.hands?.[1]?.length ?? 0),
+      },
+      2: {
+        occupied: !!room.seats[2].ws || !!room.seats[2].is_bot,
+        is_bot: !!room.seats[2].is_bot,
+        ready: !!room.seats[2].ready,
+        hand_count: (room.hands?.[2]?.length ?? 0),
+      },
+      3: {
+        occupied: !!room.seats[3].ws || !!room.seats[3].is_bot,
+        is_bot: !!room.seats[3].is_bot,
+        ready: !!room.seats[3].ready,
+        hand_count: (room.hands?.[3]?.length ?? 0),
+      },
+      4: {
+        occupied: !!room.seats[4].ws || !!room.seats[4].is_bot,
+        is_bot: !!room.seats[4].is_bot,
+        ready: !!room.seats[4].ready,
+        hand_count: (room.hands?.[4]?.length ?? 0),
+      },
     },
 
 
@@ -108,10 +130,10 @@ function getOrCreateRoom(roomId) {
 
     // seats: { 1:{ws,ready}, ... }
     seats: {
-      1: { ws: null, ready: false, is_bot: false, bot_persona: null },
-      2: { ws: null, ready: false, is_bot: false, bot_persona: null },
-      3: { ws: null, ready: false, is_bot: false, bot_persona: null },
-      4: { ws: null, ready: false, is_bot: false, bot_persona: null },
+      1: { ws: null, ready: false, is_bot: false, bot_persona: null, owner_uid:null, disconnect_timer: null, disconnected_at: null, },
+      2: { ws: null, ready: false, is_bot: false, bot_persona: null, owner_uid:null, disconnect_timer: null, disconnected_at: null, },
+      3: { ws: null, ready: false, is_bot: false, bot_persona: null, owner_uid:null, disconnect_timer: null, disconnected_at: null, },
+      4: { ws: null, ready: false, is_bot: false, bot_persona: null, owner_uid:null, disconnect_timer: null, disconnected_at: null, },
     },
 
     // game state
@@ -147,8 +169,8 @@ function getOrCreateRoom(roomId) {
     match_config: {
       target_score: 500,
       board: 4,
-      first_hand_bids_itself: false,
-      renege_on: true,               // if true, legality is NOT enforced
+      first_hand_bids_itself: true,
+      renege_on: false,               // if true, legality is NOT enforced
       bot_takeover_on_disconnect: false,
       min_total_bid: 11,
 
@@ -193,6 +215,45 @@ function sendState(room) {
   if (room.phase !== 'playing' || !isTurnPaused(room)) {
     scheduleBotAct(room);
   }
+}
+
+function base64urlToBuf(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Buffer.from(s, 'base64');
+}
+
+function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  return require('crypto').timingSafeEqual(a, b);
+}
+
+function verifyWsToken(token, expectedRoom) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+
+  const [payloadB64, sigB64] = parts;
+
+  const secret = process.env.BJS_WS_SECRET; // MUST match BJS_WS_SECRET in WP
+  if (!secret) throw new Error('Missing BJS_WS_SECRET');
+
+  const crypto = require('crypto');
+  const sig = base64urlToBuf(sigB64);
+  const expectSig = crypto.createHmac('sha256', secret).update(payloadB64).digest();
+
+  if (!safeEqual(sig, expectSig)) return null;
+
+  const payloadJson = base64urlToBuf(payloadB64).toString('utf8');
+  let payload;
+  try { payload = JSON.parse(payloadJson); } catch { return null; }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (!payload.exp || now > payload.exp) return null;
+  if (payload.room !== expectedRoom) return null;
+
+  // uid can be 0 if not logged in — decide what you want to allow
+  return payload;
 }
 
 function sendHandToSeat(room, seatNum) {
@@ -1022,17 +1083,32 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 
+function kill(socket, reason) {
+  try { console.log('[WS UPGRADE REJECT]', reason); } catch(e) {}
+  socket.destroy();
+}
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const roomId = url.searchParams.get('room');
+  const token  = url.searchParams.get('token');
 
-  if (!roomId) {
-    socket.destroy();
-    return;
+  if (!roomId) return kill(socket, 'missing room');
+
+  let payload = null;
+  try {
+    payload = verifyWsToken(token, roomId);
+  } catch (e) {
+    return kill(socket, 'verify threw: ' + (e?.message || e));
   }
+
+  if (!payload) return kill(socket, 'verify failed (bad token/secret/exp/room mismatch)');
+  if (!payload.uid) return kill(socket, 'uid missing/zero (not logged in?)');
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws._roomId = roomId;
+    ws.user_id = Number(payload.uid);
+    ws._tokenPayload = payload;
     wss.emit('connection', ws, req);
   });
 });
@@ -1041,6 +1117,7 @@ wss.on('connection', (ws) => {
   const roomId = ws._roomId;
   const room = getOrCreateRoom(roomId);
 
+  safeJsonSend(ws, { type: 'auth_ok', uid: ws.user_id });
   // initial seat info
   safeJsonSend(ws, { type: 'you_are', seat: null });
   safeJsonSend(ws, { type: 'state_update', state: roomPublicState(room) });
@@ -1064,35 +1141,47 @@ wss.on('connection', (ws) => {
     // --- core lobby controls ---
     if (type === 'seat_choose') {
       const wanted = Number(msg.seat);
-      if (![1, 2, 3, 4].includes(wanted)) {
-        safeJsonSend(ws, { type: 'error', error: 'invalid_seat' });
-        return;
-      }
+      if (![1,2,3,4].includes(wanted)) return safeJsonSend(ws,{type:'error',error:'invalid_seat'});
 
-      // if already seated elsewhere, free old seat
+      const uid = Number(ws.user_id || 0);
+      if (!uid) return safeJsonSend(ws,{type:'error',error:'unauthorized'});
+
+      // if already seated elsewhere, free old seat (but keep ownership there if you want)
       if (mySeat && mySeat !== wanted) {
         room.seats[mySeat].ws = null;
         room.seats[mySeat].ready = false;
+        // optional: keep owner_uid so they can reclaim that seat later if they switch back
+        // room.seats[mySeat].owner_uid = null;
       }
 
-      if (room.seats[wanted].is_bot) {
-        safeJsonSend(ws, { type: 'error', error: 'seat_taken_by_bot' });
-        return;
+      const seatObj = room.seats[wanted];
+
+      if (seatObj.is_bot) return safeJsonSend(ws,{type:'error',error:'seat_taken_by_bot'});
+
+      // occupied by another live ws
+      if (seatObj.ws && seatObj.ws !== ws) return safeJsonSend(ws,{type:'error',error:'seat_taken'});
+
+      // owned by someone else (even if currently disconnected)
+      if (seatObj.owner_uid && seatObj.owner_uid !== uid) {
+        return safeJsonSend(ws,{type:'error',error:'seat_owned_by_other_user'});
       }
 
-      // must be empty
-      if (room.seats[wanted].ws && room.seats[wanted].ws !== ws) {
-        safeJsonSend(ws, { type: 'error', error: 'seat_taken' });
-        return;
-      }
+      // claim / reclaim
+      seatObj.owner_uid = uid;
+      seatObj.ws = ws;
+      seatObj.ready = true;
 
-      room.seats[wanted].ws = ws;
-      room.seats[wanted].ready = true;
+      // cancel pending disconnect penalty
+      if (seatObj.disconnect_timer) {
+        clearTimeout(seatObj.disconnect_timer);
+        seatObj.disconnect_timer = null;
+        seatObj.disconnected_at = null;
+      }
 
       safeJsonSend(ws, { type: 'you_are', seat: wanted });
       sendHandToSeat(room, wanted);
       sendState(room);
-      maybeStartFromLobby(room); // ✅ in case this was the last needed seat
+      maybeStartFromLobby(room);
       return;
     }
 
@@ -1178,6 +1267,7 @@ wss.on('connection', (ws) => {
       if (mySeat) {
         room.seats[mySeat].ws = null;
         room.seats[mySeat].ready = false;
+        //room.seats[mySeat].owner_uid = null;
       }
       safeJsonSend(ws, { type: 'you_are', seat: null });
       sendState(room);
@@ -1332,21 +1422,38 @@ wss.on('connection', (ws) => {
     const seat = findSeatByWs(room, ws);
     if (!seat) return;
 
-    // clear socket
-    room.seats[seat].ws = null;
-    room.seats[seat].ready = false;
+    const seatObj = room.seats[seat];
 
-    // only enforce during active gameplay phases
+    seatObj.ws = null;
+    seatObj.ready = false;
+    seatObj.disconnected_at = Date.now();
+
     const activePhases = new Set(['bidding', 'negotiating', 'playing']);
     if (!activePhases.has(room.phase)) {
       sendState(room);
       return;
     }
 
-    const takeover = !!room?.match_config?.bot_takeover_on_disconnect;
+    // ⏳ start grace timer
+    seatObj.disconnect_timer = setTimeout(() => {
+      seatObj.disconnect_timer = null;
 
-    // DEFAULT OFF => forfeit
-    if (!takeover) {
+      // if they reconnected, do nothing
+      if (seatObj.ws) return;
+
+      const takeover = !!room?.match_config?.bot_takeover_on_disconnect;
+
+      if (takeover) {
+        seatObj.is_bot = true;
+        seatObj.bot_persona = 'default';
+        seatObj.ready = true;
+
+        sendState(room);
+        scheduleBotAct(room);
+        return;
+      }
+
+      // 🚨 forfeit
       const forfeitingTeam = seatToTeam(seat);
       const winnerTeam = otherTeam(forfeitingTeam);
 
@@ -1359,20 +1466,11 @@ wss.on('connection', (ws) => {
         final_score: room.match?.score,
       });
 
-      // freeze the room so nothing continues after match_complete
       room.phase = 'complete';
       sendState(room);
-      return;
-    }
+    }, DISCONNECT_GRACE_MS);
 
-    // takeover enabled: convert seat to a bot and continue
-    room.seats[seat].is_bot = true;
-    room.seats[seat].bot_persona = 'default';
-    room.seats[seat].ready = true;
-
-    sendState(room);
-    scheduleBotAct(room);
-    return;
+    sendState(room); // show "disconnected" immediately in UI
   });
 
 

@@ -5,7 +5,7 @@
   "description": "Big Joker Spades websocket server",
   "main": "server.js",
   "scripts": {
-    "dev": "PORT=3001 node server.js"
+    "dev": "BJS_WS_SECRET=6a70330208e54967f506e86d1a60a9db9f04e6e95931ab0497538710d5747cf7 PORT=3001 node server.js"
   },
   "dependencies": {
     "ws": "^8.19.0"
