@@ -1,6 +1,6 @@
 // server.js
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws'); // ✅ include WebSocket
 
 // root-level requires (IMPORTANT)
 const deck = require('./functions/deck');
@@ -16,7 +16,7 @@ const PORT = Number(process.env.PORT || 3001);
 const rooms = new Map(); // roomId -> room object
 
 function safeJsonSend(ws, obj) {
-  if (!ws || ws.readyState !== ws.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return; // ✅ use WebSocket.OPEN
   ws.send(JSON.stringify(obj));
 }
 
@@ -40,7 +40,7 @@ function roomPublicState(room) {
     books: room.books,
 
     final_bids: room.final_bids,
-    
+
     match: {
       hand_number: room.hand_number,
       score: room.match.score,
@@ -48,7 +48,25 @@ function roomPublicState(room) {
       target_score: room.match.target_score,
     },
 
-    current_trick: room.current_trick,
+    //current_trick: room.current_trick,
+    current_trick: {
+      leaderSeat: room.current_trick?.leaderSeat ?? null,
+      leadSuit: room.current_trick?.leadSuit ?? null,
+      plays: (room.current_trick?.plays || []).map(p => ({
+        seat: p.seat,
+        card_id: p.card_id,
+
+        // include tiny card payload for rendering
+        card: p.card ? {
+          id: p.card.id,
+          rank: p.card.rank,
+          suit: p.card.suit,
+          is_joker: !!p.card.is_joker,
+          joker_color: p.card.joker_color || null,
+          is_trump: !!p.card.is_trump,
+        } : null,
+      })),
+    },
     trick_history: (room.trick_history || []).map(t => ({
       ...t,
       renege_calls: (room.renege?.calls || []).filter(c =>
@@ -655,6 +673,14 @@ function playCardForSeat(room, seatNum, cardId) {
       play_index: i,
       had_led_suit_before_play: p.had_led_suit_before_play,
       played_eff_suit: trick.effectiveSuit(p.card),
+      card: p.card ? {
+        id: p.card.id,
+        rank: p.card.rank,
+        suit: p.card.suit,
+        is_joker: !!p.card.is_joker,
+        joker_color: p.card.joker_color || null,
+        is_trump: !!p.card.is_trump,
+      } : null,
     })),
   });
 
