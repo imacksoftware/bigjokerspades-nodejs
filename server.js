@@ -9,6 +9,7 @@ const dealer = require('./functions/dealer');
 const trick = require('./functions/trick');
 const bidding = require('./functions/bidding');
 const scoring = require('./functions/scoring');
+const bots = require('./bots'); 
 
 const PORT = Number(process.env.PORT || 3001);
 
@@ -64,6 +65,15 @@ function roomPublicState(room) {
       adjustment: room.renege?.adjustment || { A: 0, B: 0 },
       calls: room.renege?.calls || [],
     },
+
+    seats_public: {
+      1: { occupied: !!room.seats[1].ws || !!room.seats[1].is_bot, is_bot: !!room.seats[1].is_bot, ready: !!room.seats[1].ready },
+      2: { occupied: !!room.seats[2].ws || !!room.seats[2].is_bot, is_bot: !!room.seats[2].is_bot, ready: !!room.seats[2].ready },
+      3: { occupied: !!room.seats[3].ws || !!room.seats[3].is_bot, is_bot: !!room.seats[3].is_bot, ready: !!room.seats[3].ready },
+      4: { occupied: !!room.seats[4].ws || !!room.seats[4].is_bot, is_bot: !!room.seats[4].is_bot, ready: !!room.seats[4].ready },
+    },
+
+
   };
 }
 
@@ -78,10 +88,10 @@ function getOrCreateRoom(roomId) {
 
     // seats: { 1:{ws,ready}, ... }
     seats: {
-      1: { ws: null, ready: false },
-      2: { ws: null, ready: false },
-      3: { ws: null, ready: false },
-      4: { ws: null, ready: false },
+      1: { ws: null, ready: false, is_bot: false, bot_persona: null },
+      2: { ws: null, ready: false, is_bot: false, bot_persona: null },
+      3: { ws: null, ready: false, is_bot: false, bot_persona: null },
+      4: { ws: null, ready: false, is_bot: false, bot_persona: null },
     },
 
     // game state
@@ -159,6 +169,7 @@ function findSeatByWs(room, ws) {
 
 function sendState(room) {
   broadcastRoom(room, { type: 'state_update', state: roomPublicState(room) });
+  scheduleBotAct(room);
 }
 
 function sendHandToSeat(room, seatNum) {
@@ -173,8 +184,10 @@ function sendHandToSeat(room, seatNum) {
 
 function allSeatedAndReady(room) {
   for (const s of [1, 2, 3, 4]) {
-    if (!room.seats[s].ws) return false;
-    if (!room.seats[s].ready) return false;
+    const seat = room.seats[s];
+    const occupied = !!seat.ws || !!seat.is_bot;
+    if (!occupied) return false;
+    if (!seat.ready) return false;
   }
   return true;
 }
@@ -193,6 +206,178 @@ function handHasEffectiveSuit(hand, suit) {
 
 function handIsAllTrump(hand) {
   return Array.isArray(hand) && hand.length > 0 && hand.every(c => !!c.is_trump);
+}
+
+function isBotSeat(room, seatNum) {
+  const s = room?.seats?.[seatNum];
+  return !!s && !!s.is_bot && !s.ws;
+}
+
+function scheduleBotAct(room) {
+  if (!room) return;
+  if (room._botTickScheduled) return;
+  room._botTickScheduled = true;
+
+  setTimeout(() => {
+    room._botTickScheduled = false;
+    maybeBotAct(room);
+  }, 50);
+}
+
+function maybeBotAct(room) {
+  if (!room) return;
+
+  // don't act in lobby or complete
+  if (room.phase === 'lobby' || room.phase === 'complete') return;
+
+  // prevent runaway loops
+  if (room._botLoopGuard && room._botLoopGuard > 30) {
+    room._botLoopGuard = 0;
+    return;
+  }
+  room._botLoopGuard = (room._botLoopGuard || 0) + 1;
+
+  // ---------- BIDDING ----------
+  if (room.phase === 'bidding') {
+    // bots can set bids anytime; confirm logic remains enforced by bidding.js
+    for (const s of [1,2,3,4]) {
+      if (!isBotSeat(room, s)) continue;
+
+      const bot = bots.getBot(room.seats[s].bot_persona);
+      const hand = room.hands?.[s] || [];
+
+      // pick a bid (NO NIL)
+      const bid = Number(bot.chooseBid(room, s, hand));
+      if (Number.isFinite(bid) && bid >= 1 && bid <= 13) {
+        const r = bidding.handleBidSet(room, s, bid);
+        if (r?.ok) {
+          // broadcast will happen via sendState
+          sendState(room);
+        }
+      }
+    }
+
+    // also attempt confirm if eligible
+    for (const s of [1,2,3,4]) {
+      if (!isBotSeat(room, s)) continue;
+      const r = bidding.handleBidConfirm(room, s);
+      if (r?.ok) {
+        ensurePlayingTurnInitialized(room);
+        sendState(room);
+      }
+    }
+
+    room._botLoopGuard = 0;
+    scheduleBotAct(room);
+    return;
+  }
+
+  // ---------- NEGOTIATING ----------
+  if (room.phase === 'negotiating') {
+    const n = room?.bidding?.negotiation;
+    if (!n) return;
+
+    // stage choose: bots pick
+    if (n.stage === 'choose') {
+      for (const s of [1,2,3,4]) {
+        if (!isBotSeat(room, s)) continue;
+        const myTeam = seatToTeam(s);
+        const bot = bots.getBot(room.seats[s].bot_persona);
+        const choice = bot.chooseNegotiationChoice(room, myTeam, n);
+        const r = bidding.handleNegotiationChoice(room, s, choice);
+        if (r?.ok) sendState(room);
+      }
+    }
+
+    // stage accept: bots respond
+    if (n.stage === 'one_books_waiting_accept') {
+      for (const s of [1,2,3,4]) {
+        if (!isBotSeat(room, s)) continue;
+        const myTeam = seatToTeam(s);
+        const bot = bots.getBot(room.seats[s].bot_persona);
+        const accept = bot.chooseNegotiationResponse(room, myTeam, n);
+        const r = bidding.handleNegotiationResponse(room, s, accept);
+        if (r?.ok) {
+          ensurePlayingTurnInitialized(room);
+          sendState(room);
+        }
+      }
+    }
+
+    // if negotiation resolves to books-made scoring, your existing maybeAutoResolveNegotiation handles it
+    maybeAutoResolveNegotiation(room);
+
+    room._botLoopGuard = 0;
+    scheduleBotAct(room);
+    return;
+  }
+
+  // ---------- PLAYING ----------
+  if (room.phase === 'playing') {
+    ensurePlayingTurnInitialized(room);
+
+    const turn = Number(room.turn_seat);
+    if (!Number.isFinite(turn)) return;
+
+    if (!isBotSeat(room, turn)) {
+      room._botLoopGuard = 0;
+      return;
+    }
+
+    const hand = room.hands?.[turn] || [];
+    if (!hand.length) return;
+
+    // choose a card
+    const leadSuit = room.current_trick?.leadSuit || null;
+
+    // compute legal set (if renege_on, everything is “legal”)
+    let candidates = hand.slice();
+
+    if (!isRenegeOn(room)) {
+      // legality ON: we must follow suit if possible
+      if (leadSuit) {
+        const mustFollow = handHasEffectiveSuit(hand, leadSuit);
+        if (mustFollow) {
+          candidates = hand.filter(c => cardEffectiveSuit(c) === leadSuit);
+        }
+      } else {
+        // leading: can't lead trump if not broken unless all trump
+        if (!room.spades_broken) {
+          const hasNonTrump = hand.some(c => cardEffectiveSuit(c) !== 'S');
+          if (hasNonTrump) {
+            candidates = hand.filter(c => cardEffectiveSuit(c) !== 'S');
+          }
+        }
+      }
+    } else {
+      // legality OFF: still prefer follow suit if possible (so bots “look normal”)
+      if (leadSuit) {
+        const follow = hand.filter(c => cardEffectiveSuit(c) === leadSuit);
+        if (follow.length) candidates = follow;
+      }
+    }
+
+    // pick “lowest” by a simple heuristic
+    candidates.sort((a,b) => {
+      const pa = (a.is_trump ? 10 : 0) + (isJoker(a) ? 100 : 0) + (isDeuce(a) ? 50 : 0);
+      const pb = (b.is_trump ? 10 : 0) + (isJoker(b) ? 100 : 0) + (isDeuce(b) ? 50 : 0);
+      return pa - pb;
+    });
+
+    const card = candidates[0];
+    const r = playCardForSeat(room, turn, card.id);
+    if (!r.ok) {
+      // if something unexpected happens, try another card once
+      const alt = candidates[1];
+      if (alt) playCardForSeat(room, turn, alt.id);
+    }
+
+    room._botLoopGuard = 0;
+    scheduleBotAct(room);
+    return;
+  }
+
+  room._botLoopGuard = 0;
 }
 
 function seatToTeam(seat) {
@@ -260,6 +445,8 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   ensureRenegeState(room);
 
   if (room.phase !== 'playing') return { ok: false, error: 'not_in_playing' };
+  // renege accusations ONLY when renege_on is true
+  if (!isRenegeOn(room)) return { ok: false, error: 'renege_calls_disabled_when_renege_off' };
 
   // once all 13 tricks are recorded, lock renege calls for this hand
   if (Array.isArray(room.trick_history) && room.trick_history.length >= 13) {
@@ -359,6 +546,117 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
   room.renege.calls.push(record);
 
   return { ok: true, record, adjustment: room.renege.adjustment };
+}
+
+
+function playCardForSeat(room, seatNum, cardId) {
+  const mySeat = Number(seatNum);
+
+  if (room.phase !== 'playing') return { ok: false, error: 'not_in_playing' };
+
+  ensurePlayingTurnInitialized(room);
+
+  if (Number(room.turn_seat) !== mySeat) return { ok: false, error: 'not_your_turn' };
+
+  const hand = room.hands?.[mySeat] || [];
+  const idx = hand.findIndex(c => String(c.id) === String(cardId));
+  if (idx === -1) return { ok: false, error: 'card_not_in_hand' };
+
+  const card = hand[idx];
+
+  const leadSuitNow = room.current_trick?.leadSuit || null;
+  const hadLedSuitBeforePlay = leadSuitNow ? handHasEffectiveSuit(hand, leadSuitNow) : null;
+
+  const legal = validatePlayLegality(room, mySeat, card);
+  if (!legal.ok) return { ok: false, error: legal.error };
+
+  // remove from hand
+  hand.splice(idx, 1);
+  room.hands[mySeat] = hand;
+
+  if (!room.current_trick.leaderSeat) room.current_trick.leaderSeat = mySeat;
+  if (!room.current_trick.leadSuit) room.current_trick.leadSuit = trick.effectiveSuit(card);
+
+  room.current_trick.plays.push({
+    seat: mySeat,
+    card_id: card.id,
+    card,
+    had_led_suit_before_play: hadLedSuitBeforePlay,
+  });
+
+  if (card.is_trump) room.spades_broken = true;
+
+  if (room.current_trick.plays.length < 4) {
+    room.turn_seat = trick.nextSeatClockwise(mySeat);
+    sendState(room);
+    // only send hand updates to humans
+    if (room.seats[mySeat].ws) sendHandToSeat(room, mySeat);
+    return { ok: true };
+  }
+
+  const winnerSeat = trick.determineTrickWinner(room.current_trick);
+  const winnerTeam = trick.teamForSeat(winnerSeat);
+
+  room.books[winnerTeam] = Number(room.books[winnerTeam] ?? 0) + 1;
+
+  room.trick_history.push({
+    trick_index: room.trick_index,
+    leader_seat: room.current_trick.leaderSeat,
+    lead_suit: room.current_trick.leadSuit,
+    winner_seat: winnerSeat,
+    winner_team: winnerTeam,
+    plays: room.current_trick.plays.map((p, i) => ({
+      seat: p.seat,
+      card_id: p.card_id,
+      play_index: i,
+      had_led_suit_before_play: p.had_led_suit_before_play,
+      played_eff_suit: trick.effectiveSuit(p.card),
+    })),
+  });
+
+  const handIsOver = (room.trick_history.length >= 13);
+
+  if (handIsOver) {
+    const isFirstHandBidsItself =
+      room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
+
+    let r;
+
+    if (isFirstHandBidsItself) {
+      const delta = {
+        A: Number(room.books.A ?? 0) * 10,
+        B: Number(room.books.B ?? 0) * 10,
+      };
+
+      room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
+      room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
+
+      r = {
+        ok: true,
+        mode: 'first_hand_bids_itself',
+        delta,
+        bags: room.match.bags,
+        detail: { books: room.books },
+      };
+    } else {
+      r = scorePlayedHand(room);
+    }
+
+    if (!r?.ok) return { ok: false, error: r?.error || 'score_failed' };
+
+    endHandAndMaybeStartNext(room, r);
+    return { ok: true };
+  }
+
+  room.trick_index += 1;
+  room.current_trick = trick.startTrick(winnerSeat);
+  room.turn_seat = winnerSeat;
+
+  sendState(room);
+
+  if (room.seats[mySeat].ws) sendHandToSeat(room, mySeat);
+
+  return { ok: true };
 }
 
 function scorePlayedHand(room) {
@@ -596,6 +894,11 @@ wss.on('connection', (ws) => {
         room.seats[mySeat].ready = false;
       }
 
+      if (room.seats[wanted].is_bot) {
+        safeJsonSend(ws, { type: 'error', error: 'seat_taken_by_bot' });
+        return;
+      }
+
       // must be empty
       if (room.seats[wanted].ws && room.seats[wanted].ws !== ws) {
         safeJsonSend(ws, { type: 'error', error: 'seat_taken' });
@@ -618,6 +921,73 @@ wss.on('connection', (ws) => {
       room.seats[mySeat].ready = !!msg.ready;
       sendState(room);
       maybeStartFromLobby(room);
+      return;
+    }
+
+    if (type === 'bot_add') {
+      if (room.phase !== 'lobby') {
+        safeJsonSend(ws, { type: 'error', error: 'bots_only_in_lobby' });
+        return;
+      }
+
+      // only seat 1 (administrator) can add bots
+      if (mySeat !== 1) {
+        safeJsonSend(ws, { type: 'error', error: 'only_admin_can_manage_bots' });
+        return;
+      }
+
+      const wanted = Number(msg.seat);
+      const persona = String(msg.persona || 'default');
+
+      if (![1,2,3,4].includes(wanted)) {
+        safeJsonSend(ws, { type: 'error', error: 'invalid_seat' });
+        return;
+      }
+
+      // can't overwrite a human
+      if (room.seats[wanted].ws) {
+        safeJsonSend(ws, { type: 'error', error: 'seat_taken' });
+        return;
+      }
+
+      room.seats[wanted].is_bot = true;
+      room.seats[wanted].bot_persona = persona;
+      room.seats[wanted].ready = true; // bots auto-ready
+
+      sendState(room);
+      maybeStartFromLobby(room);
+      return;
+    }
+
+    if (type === 'bot_remove') {
+      if (room.phase !== 'lobby') {
+        safeJsonSend(ws, { type: 'error', error: 'bots_only_in_lobby' });
+        return;
+      }
+
+      // only seat 1 (administrator) can remove bots
+      if (mySeat !== 1) {
+        safeJsonSend(ws, { type: 'error', error: 'only_admin_can_manage_bots' });
+        return;
+      }
+
+      const wanted = Number(msg.seat);
+      if (![1,2,3,4].includes(wanted)) {
+        safeJsonSend(ws, { type: 'error', error: 'invalid_seat' });
+        return;
+      }
+
+      // only remove if it's a bot and no human is there
+      if (room.seats[wanted].ws) {
+        safeJsonSend(ws, { type: 'error', error: 'seat_taken' });
+        return;
+      }
+
+      room.seats[wanted].is_bot = false;
+      room.seats[wanted].bot_persona = null;
+      room.seats[wanted].ready = false;
+
+      sendState(room);
       return;
     }
 
@@ -644,7 +1014,13 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      const r = bidding.handleBidSet(room, mySeat, msg.bid);
+      const bidNum = Number(msg.bid);
+      if (!Number.isFinite(bidNum) || bidNum < 1 || bidNum > 13) {
+        safeJsonSend(ws, { type: 'error', error: 'invalid_bid' });
+        return;
+      }
+      const r = bidding.handleBidSet(room, mySeat, bidNum);
+
       if (!r.ok) {
         safeJsonSend(ws, { type: 'error', error: r.error });
         return;
@@ -715,150 +1091,19 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      if (room.phase !== 'playing') {
-        safeJsonSend(ws, { type: 'error', error: 'not_in_playing' });
-        return;
-      }
-
-      ensurePlayingTurnInitialized(room);
-
-      if (Number(room.turn_seat) !== Number(mySeat)) {
-        safeJsonSend(ws, { type: 'error', error: 'not_your_turn' });
-        return;
-      }
-
       const cardId = String(msg.card_id || '');
       if (!cardId) {
         safeJsonSend(ws, { type: 'error', error: 'missing_card_id' });
         return;
       }
 
-      const hand = room.hands?.[mySeat] || [];
-      const idx = hand.findIndex(c => String(c.id) === cardId);
-      if (idx === -1) {
-        safeJsonSend(ws, { type: 'error', error: 'card_not_in_hand' });
+      const r = playCardForSeat(room, mySeat, cardId);
+
+      if (!r.ok) {
+        safeJsonSend(ws, { type: 'error', error: r.error });
         return;
       }
 
-      const card = hand[idx];
-      // capture whether player HAD the lead suit BEFORE this play (for renege proof)
-      // NOTE: leadSuit is stored as an "effective suit" in your engine
-      const leadSuitNow = room.current_trick?.leadSuit || null;
-      const hadLedSuitBeforePlay = leadSuitNow ? handHasEffectiveSuit(hand, leadSuitNow) : null;
-
-      // legality enforcement (unless renege_on)
-      const legal = validatePlayLegality(room, mySeat, card);
-      if (!legal.ok) {
-        safeJsonSend(ws, { type: 'error', error: legal.error });
-        return;
-      }
-
-      // remove from hand
-      hand.splice(idx, 1);
-      room.hands[mySeat] = hand;
-
-      // set leader / lead suit on first play of trick
-      if (!room.current_trick.leaderSeat) room.current_trick.leaderSeat = mySeat;
-
-      if (!room.current_trick.leadSuit) {
-        room.current_trick.leadSuit = trick.effectiveSuit(card); // "S" if trump, else actual suit
-      }
-
-      // record play (store BOTH card_id + card for winner logic)
-      room.current_trick.plays.push({
-        seat: mySeat,
-        card_id: card.id,
-        card,
-
-        // renege proof (only meaningful when leadSuitNow is non-null)
-        had_led_suit_before_play: hadLedSuitBeforePlay,
-      });
-
-      // spades broken flag (simple: if any trump played)
-      if (card.is_trump) room.spades_broken = true;
-
-      // if trick not complete yet -> advance turn
-      if (room.current_trick.plays.length < 4) {
-        room.turn_seat = trick.nextSeatClockwise(mySeat);
-        sendState(room);
-        sendHandToSeat(room, mySeat);
-        return;
-      }
-
-      // ---- trick finished (4 plays) ----
-      const winnerSeat = trick.determineTrickWinner(room.current_trick);
-      const winnerTeam = trick.teamForSeat(winnerSeat);
-
-      // update books
-      room.books[winnerTeam] = Number(room.books[winnerTeam] ?? 0) + 1;
-
-      // push into history (keep UI-friendly fields)
-      room.trick_history.push({
-        trick_index: room.trick_index,
-        leader_seat: room.current_trick.leaderSeat,
-        lead_suit: room.current_trick.leadSuit,
-        winner_seat: winnerSeat,
-        winner_team: winnerTeam,
-        plays: room.current_trick.plays.map((p, i) => ({
-          seat: p.seat,
-          card_id: p.card_id,
-
-          // optional but helpful: deterministic index of the play within the trick
-          play_index: i,
-
-          // renege proof flag
-          had_led_suit_before_play: p.had_led_suit_before_play,
-          played_eff_suit: trick.effectiveSuit(p.card),
-        })),
-      });
-
-      // ---- HAND END CHECK (THIS IS WHERE YOUR “handIsOver” SNIPPET GOES) ----
-      const handIsOver = (room.trick_history.length >= 13); // 13 tricks
-
-      if (handIsOver) {
-        
-        const isFirstHandBidsItself =
-          room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
-
-        let r;
-
-        if (isFirstHandBidsItself) {
-          const delta = {
-            A: Number(room.books.A ?? 0) * 10,
-            B: Number(room.books.B ?? 0) * 10,
-          };
-
-          room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
-          room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
-
-          r = {
-            ok: true,
-            mode: 'first_hand_bids_itself',
-            delta,
-            bags: room.match.bags,
-            detail: { books: room.books },
-          };
-        } else {
-          r = scorePlayedHand(room); // now uses scoring.js (bubble/bags)
-        }
-
-        if (!r?.ok) {
-          console.error('scorePlayedHand failed:', r?.error);
-          return;
-        }
-        endHandAndMaybeStartNext(room, r);
-        return;
-      }
-
-      // ---- start next trick (THIS IS WHERE YOUR “start next trick” SNIPPET GOES) ----
-      room.trick_index += 1;
-      room.current_trick = trick.startTrick(winnerSeat);
-      room.turn_seat = winnerSeat;
-
-      sendState(room);
-
-      // send updated hand to the player who just played (so their card disappears immediately)
-      sendHandToSeat(room, mySeat);
       return;
     }
 
@@ -926,8 +1171,14 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // later (milestone 6): bot takeover path
+    // takeover enabled: convert seat to a bot and continue
+    room.seats[seat].is_bot = true;
+    room.seats[seat].bot_persona = 'default';
+    room.seats[seat].ready = true;
+
     sendState(room);
+    scheduleBotAct(room);
+    return;
   });
 
 
