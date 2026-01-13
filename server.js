@@ -39,6 +39,8 @@ function roomPublicState(room) {
 
     books: room.books,
 
+    final_bids: room.final_bids,
+    
     match: {
       hand_number: room.hand_number,
       score: room.match.score,
