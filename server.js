@@ -127,7 +127,7 @@ function getOrCreateRoom(roomId) {
     match_config: {
       target_score: 500,
       board: 4,
-      first_hand_bids_itself: true,
+      first_hand_bids_itself: false,
       renege_on: true,               // if true, legality is NOT enforced
       bot_takeover_on_disconnect: false,
       // optional override:
@@ -192,6 +192,21 @@ function allSeatedAndReady(room) {
   return true;
 }
 
+function isJoker(card) {
+  if (!card) return false;
+  // support both styles depending on how deck.js builds cards
+  if (card.is_joker === true) return true;
+  if (String(card.rank).toUpperCase() === 'JOKER') return true;
+  // optional fallback if you ever store jokers differently
+  if (String(card.id || '').toUpperCase().includes('JOKER')) return true;
+  return false;
+}
+
+function isDeuce(card) {
+  if (!card) return false;
+  return String(card.rank) === '2';
+}
+
 function isRenegeOn(room) {
   return !!room?.match_config?.renege_on;
 }
@@ -239,6 +254,8 @@ function maybeBotAct(room) {
 
   // ---------- BIDDING ----------
   if (room.phase === 'bidding') {
+    const board = Number(room.match_config?.board ?? 4);
+
     // bots can set bids anytime; confirm logic remains enforced by bidding.js
     for (const s of [1,2,3,4]) {
       if (!isBotSeat(room, s)) continue;
@@ -246,14 +263,26 @@ function maybeBotAct(room) {
       const bot = bots.getBot(room.seats[s].bot_persona);
       const hand = room.hands?.[s] || [];
 
-      // pick a bid (NO NIL)
-      const bid = Number(bot.chooseBid(room, s, hand));
-      if (Number.isFinite(bid) && bid >= 1 && bid <= 13) {
-        const r = bidding.handleBidSet(room, s, bid);
-        if (r?.ok) {
-          // broadcast will happen via sendState
-          sendState(room);
-        }
+      // base bid from bot
+      let bid = Number(bot.chooseBid(room, s, hand));
+
+      // ensure team total reaches board once mate has a pick
+      const mate = (s === 1 ? 3 : s === 3 ? 1 : s === 2 ? 4 : 2);
+      const matePickRaw = room.bidding?.picks?.[mate];
+      const matePick = (matePickRaw === null || matePickRaw === undefined) ? null : Number(matePickRaw);
+
+      if (Number.isFinite(matePick)) {
+        const need = Math.max(1, board - matePick);
+        if (!Number.isFinite(bid)) bid = need;
+        bid = Math.max(bid, need);
+      }
+
+      // clamp
+      bid = Math.max(1, Math.min(13, Number.isFinite(bid) ? bid : 1));
+
+      const r = bidding.handleBidSet(room, s, bid);
+      if (r?.ok) {
+        sendState(room);
       }
     }
 
