@@ -251,41 +251,29 @@ function maybeBotAct(room) {
   }
   room._botLoopGuard = (room._botLoopGuard || 0) + 1;
 
+
   // ---------- BIDDING ----------
   if (room.phase === 'bidding') {
-    const board = Number(room.match_config?.board ?? 4);
+    // make sure bidding state exists
+    if (!room.bidding) room.bidding = bidding.initBidding(room);
 
-    // bots can set bids anytime; confirm logic remains enforced by bidding.js
     for (const s of [1,2,3,4]) {
       if (!isBotSeat(room, s)) continue;
 
       const bot = bots.getBot(room.seats[s].bot_persona);
       const hand = room.hands?.[s] || [];
 
-      // base bid from bot
       let bid = Number(bot.chooseBid(room, s, hand));
 
-      // ensure team total reaches board once mate has a pick
-      const mate = (s === 1 ? 3 : s === 3 ? 1 : s === 2 ? 4 : 2);
-      const matePickRaw = room.bidding?.picks?.[mate];
-      const matePick = (matePickRaw === null || matePickRaw === undefined) ? null : Number(matePickRaw);
-
-      if (Number.isFinite(matePick)) {
-        const need = Math.max(1, board - matePick);
-        if (!Number.isFinite(bid)) bid = need;
-        bid = Math.max(bid, need);
-      }
-
-      // clamp
-      bid = Math.max(1, Math.min(13, Number.isFinite(bid) ? bid : 1));
+      // force valid bid 1..13
+      if (!Number.isFinite(bid)) bid = 1;
+      bid = Math.max(1, Math.min(13, bid));
 
       const r = bidding.handleBidSet(room, s, bid);
-      if (r?.ok) {
-        sendState(room);
-      }
+      if (r?.ok) sendState(room);
     }
 
-    // also attempt confirm if eligible
+    // bots attempt confirm when allowed
     for (const s of [1,2,3,4]) {
       if (!isBotSeat(room, s)) continue;
       const r = bidding.handleBidConfirm(room, s);
@@ -305,25 +293,31 @@ function maybeBotAct(room) {
     const n = room?.bidding?.negotiation;
     if (!n) return;
 
-    // stage choose: bots pick
+    // stage choose: bots pick (ONLY if both players on that team are bots)
     if (n.stage === 'choose') {
-      for (const s of [1,2,3,4]) {
+      for (const s of [1, 2, 3, 4]) {
         if (!isBotSeat(room, s)) continue;
+        if (!botCanNegotiateForSeat(room, s)) continue; // ✅ NEW
+
         const myTeam = seatToTeam(s);
         const bot = bots.getBot(room.seats[s].bot_persona);
         const choice = bot.chooseNegotiationChoice(room, myTeam, n);
+
         const r = bidding.handleNegotiationChoice(room, s, choice);
         if (r?.ok) sendState(room);
       }
     }
 
-    // stage accept: bots respond
+    // stage accept: bots respond (ONLY if both players on that team are bots)
     if (n.stage === 'one_books_waiting_accept') {
-      for (const s of [1,2,3,4]) {
+      for (const s of [1, 2, 3, 4]) {
         if (!isBotSeat(room, s)) continue;
+        if (!botCanNegotiateForSeat(room, s)) continue; // ✅ NEW
+
         const myTeam = seatToTeam(s);
         const bot = bots.getBot(room.seats[s].bot_persona);
         const accept = bot.chooseNegotiationResponse(room, myTeam, n);
+
         const r = bidding.handleNegotiationResponse(room, s, accept);
         if (r?.ok) {
           ensurePlayingTurnInitialized(room);
@@ -332,7 +326,6 @@ function maybeBotAct(room) {
       }
     }
 
-    // if negotiation resolves to books-made scoring, your existing maybeAutoResolveNegotiation handles it
     maybeAutoResolveNegotiation(room);
 
     room._botLoopGuard = 0;
@@ -406,6 +399,21 @@ function maybeBotAct(room) {
   }
 
   room._botLoopGuard = 0;
+}
+
+function teamSeats(team) {
+  return team === 'A' ? [1, 3] : team === 'B' ? [2, 4] : [];
+}
+
+function teamHasHuman(room, team) {
+  return teamSeats(team).some(seat => !!room.seats?.[seat]?.ws);
+}
+
+function botCanNegotiateForSeat(room, seatNum) {
+  const team = seatToTeam(seatNum);
+  if (!team) return false;
+  // bots only negotiate if their team has NO humans
+  return !teamHasHuman(room, team);
 }
 
 function seatToTeam(seat) {
@@ -548,10 +556,13 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
 
   const confirmedRenege = hadLed && isOffSuit;
 
-  const deltaTeam = accTeam;
-  const delta = confirmedRenege ? +3 : -3;
+  // accuser gets +3 if correct else -3
+  const deltaAccuser = confirmedRenege ? +3 : -3;
+  // accused gets the opposite
+  const deltaAccused = -deltaAccuser;
 
-  applyRenegeDelta(room, deltaTeam, delta);
+  applyRenegeDelta(room, accTeam, deltaAccuser);
+  applyRenegeDelta(room, accusedTeam, deltaAccused);
 
   const callId = room.renege.next_id++;
   const record = {
@@ -568,7 +579,10 @@ function validateAndApplyRenegeCall(room, accuserSeat, payload) {
     played_eff_suit: playedEffSuit,
     had_led_suit_before_play: accusedPlay.had_led_suit_before_play,
     confirmed: confirmedRenege,
-    delta_tricks: delta,
+    delta_tricks: {
+      [accTeam]: deltaAccuser,
+      [accusedTeam]: deltaAccused,
+    },
   };
 
   room.renege.calls.push(record);
@@ -651,10 +665,10 @@ function playCardForSeat(room, seatNum, cardId) {
     let r;
 
     if (isFirstHandBidsItself) {
-      const delta = {
-        A: Number(room.books.A ?? 0) * 10,
-        B: Number(room.books.B ?? 0) * 10,
-      };
+      const madeA = Number(room.books.A ?? 0) + Number(room?.renege?.adjustment?.A ?? 0);
+      const madeB = Number(room.books.B ?? 0) + Number(room?.renege?.adjustment?.B ?? 0);
+
+      const delta = { A: madeA * 10, B: madeB * 10 };
 
       room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
       room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
