@@ -188,7 +188,11 @@ function findSeatByWs(room, ws) {
 
 function sendState(room) {
   broadcastRoom(room, { type: 'state_update', state: roomPublicState(room) });
-  scheduleBotAct(room);
+
+  // ✅ only tick bots when game can actually advance
+  if (room.phase !== 'playing' || !isTurnPaused(room)) {
+    scheduleBotAct(room);
+  }
 }
 
 function sendHandToSeat(room, seatNum) {
@@ -209,6 +213,10 @@ function allSeatedAndReady(room) {
     if (!seat.ready) return false;
   }
   return true;
+}
+
+function isTurnPaused(room) {
+  return room.turn_seat === null || room.turn_seat === undefined;
 }
 
 function isJoker(card) {
@@ -264,6 +272,27 @@ function clearBetweenTrickPending(room) {
     room._betweenTrickTimer = null;
   }
   room._betweenTrickSig = null;
+}
+
+function beginBetweenTrickPause(room) {
+  clearBetweenTrickPending(room);
+  clearBotPending(room); // ✅ critical: prevents “stale bot action” deadlocks
+  room.turn_seat = null; // ✅ pause
+}
+
+function scheduleBetweenTrickResume(room, onDone) {
+  const sig = trickEndSig(room);
+  room._betweenTrickSig = sig;
+
+  room._betweenTrickTimer = setTimeout(() => {
+    room._betweenTrickTimer = null;
+
+    // drop if state changed unexpectedly
+    if (room._betweenTrickSig !== sig) return;
+    if (room.phase !== 'playing') return;
+
+    onDone();
+  }, TRICK_END_DELAY_MS);
 }
 
 function scheduleBotAct(room) {
@@ -376,15 +405,20 @@ function maybeBotAct(room) {
   if (room.phase === 'playing') {
     ensurePlayingTurnInitialized(room);
 
-    const turn = Number(room.turn_seat);
-    if (!Number.isFinite(turn)) return;
-
-    if (!isBotSeat(room, turn)) {
+    if (isTurnPaused(room)) {
       room._botLoopGuard = 0;
       return;
     }
 
-    const hand = room.hands?.[turn] || [];
+    const turnSeat = Number(room.turn_seat);
+    if (![1,2,3,4].includes(turnSeat)) return;
+
+    if (!isBotSeat(room, turnSeat)) {
+      room._botLoopGuard = 0;
+      return;
+    }
+
+    const hand = room.hands?.[turnSeat] || [];
     if (!hand.length) return;
 
     // choose a card
@@ -440,12 +474,12 @@ function maybeBotAct(room) {
       // drop stale actions if anything changed
       if (botSig(room) !== sig) return;
 
-      const r = playCardForSeat(room, turn, chosen.id);
+      const r = playCardForSeat(room, turnSeat, chosen.id);
       if (!r.ok) {
         // try once more if the first choice failed unexpectedly
         const alt = candidates[1];
         if (alt && botSig(room) === sig) {
-          playCardForSeat(room, turn, alt.id);
+          playCardForSeat(room, turnSeat, alt.id);
         }
       }
     }, botThinkMs(room, 'playing'));
@@ -749,45 +783,55 @@ function playCardForSeat(room, seatNum, cardId) {
 
   const handIsOver = (room.trick_history.length >= 13);
 
-  if (handIsOver) {
-    const isFirstHandBidsItself =
-      room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
+  // ✅ pause BEFORE broadcasting, so nobody (including bots) can act during the reveal
+  beginBetweenTrickPause(room);
 
-    let r;
+  // ✅ broadcast NOW while current_trick still shows all 4 cards
+  sendState(room);
+  if (room.seats[mySeat].ws) sendHandToSeat(room, mySeat);
 
-    if (isFirstHandBidsItself) {
-      const madeA = Number(room.books.A ?? 0) + Number(room?.renege?.adjustment?.A ?? 0);
-      const madeB = Number(room.books.B ?? 0) + Number(room?.renege?.adjustment?.B ?? 0);
+  // ✅ after delay, either score/end hand or start next trick
+  scheduleBetweenTrickResume(room, () => {
+    if (handIsOver) {
+      const isFirstHandBidsItself =
+        room.hand_number === 1 && !!room.match_config?.first_hand_bids_itself;
 
-      const delta = { A: madeA * 10, B: madeB * 10 };
+      let r;
 
-      room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
-      room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
+      if (isFirstHandBidsItself) {
+        const madeA = Number(room.books.A ?? 0) + Number(room?.renege?.adjustment?.A ?? 0);
+        const madeB = Number(room.books.B ?? 0) + Number(room?.renege?.adjustment?.B ?? 0);
 
-      r = {
-        ok: true,
-        mode: 'first_hand_bids_itself',
-        delta,
-        bags: room.match.bags,
-        detail: { books: room.books },
-      };
-    } else {
-      r = scorePlayedHand(room);
+        const delta = { A: madeA * 10, B: madeB * 10 };
+
+        room.match.score.A = Number(room.match.score.A ?? 0) + delta.A;
+        room.match.score.B = Number(room.match.score.B ?? 0) + delta.B;
+
+        r = {
+          ok: true,
+          mode: 'first_hand_bids_itself',
+          delta,
+          bags: room.match.bags,
+          detail: { books: room.books },
+        };
+      } else {
+        r = scorePlayedHand(room);
+      }
+
+      if (!r?.ok) return;
+
+      endHandAndMaybeStartNext(room, r);
+      return;
     }
 
-    if (!r?.ok) return { ok: false, error: r?.error || 'score_failed' };
+    // next trick
+    room.trick_index += 1;
+    room.current_trick = trick.startTrick(winnerSeat);
+    room.turn_seat = winnerSeat; // ✅ unpause
 
-    endHandAndMaybeStartNext(room, r);
-    return { ok: true };
-  }
-
-  room.trick_index += 1;
-  room.current_trick = trick.startTrick(winnerSeat);
-  room.turn_seat = winnerSeat;
-
-  sendState(room);
-
-  if (room.seats[mySeat].ws) sendHandToSeat(room, mySeat);
+    sendState(room);
+    scheduleBotAct(room); // ✅ force a tick immediately
+  });
 
   return { ok: true };
 }
@@ -894,6 +938,9 @@ function ensurePlayingTurnInitialized(room) {
 }
 
 function endHandAndMaybeStartNext(room, scoredResult, meta = {}) {
+  clearBetweenTrickPending(room);
+  clearBotPending(room);
+
   broadcastRoom(room, {
     type: 'hand_complete',
     hand_number: room.hand_number,
